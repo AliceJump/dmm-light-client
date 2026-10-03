@@ -8,14 +8,16 @@ import time
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath,
+    QPixmap)
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QProgressBar, QPushButton,
     QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
-from .backend.games import SUPPORTED, GameService, catalog, records, refresh_catalog
+from .backend.games import SUPPORTED, GameService, catalog, cover_path, records, refresh_catalog, save_cover
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import DmmError, LoginRequired, OperationCancelled, atomic_write, data_dir, valid_proxy
@@ -33,6 +35,32 @@ def load_settings():
 def divider():
     line = QFrame(); line.setObjectName('divider'); line.setFrameShape(QFrame.HLine); line.setFixedHeight(1)
     return line
+
+
+def cover_label():
+    label = QLabel('暂无封面\n选择后自动下载'); label.setObjectName('cover'); label.setAlignment(Qt.AlignCenter)
+    label.setFixedSize(340, 150)
+    return label
+
+
+def rounded_pixmap(pixmap, radius=10):
+    result = QPixmap(pixmap.size()); result.fill(Qt.transparent)
+    painter = QPainter(result); painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    path = QPainterPath(); path.addRoundedRect(0, 0, result.width(), result.height(), radius, radius)
+    painter.setClipPath(path); painter.drawPixmap(0, 0, pixmap); painter.end()
+    return result
+
+
+def app_icon():
+    pixmap = QPixmap(256, 256); pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap); painter.setRenderHint(QPainter.Antialiasing)
+    gradient = QLinearGradient(0, 0, 256, 256)
+    gradient.setColorAt(0, QColor('#4d7dff')); gradient.setColorAt(1, QColor('#7a5cff'))
+    painter.setBrush(gradient); painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(16, 16, 224, 224, 56, 56)
+    painter.setPen(Qt.white); font = QFont('Segoe UI', 110); font.setBold(True); painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, 'D'); painter.end()
+    return QIcon(pixmap)
 
 
 class Worker(QThread):
@@ -75,6 +103,13 @@ class Worker(QThread):
                     NodeStore(root).import_node(self.node_text, self.settings['proxy'], self.message.emit)
                     self.finished_ok.emit('节点已加密导入'); return
                 with operation_proxy(self.settings, self.message.emit, self.check_cancel, root) as proxy:
+                    if self.action == 'cover':
+                        with requests.Session() as http:
+                            http.trust_env = False
+                            http.proxies = {'http': proxy, 'https': proxy}
+                            attach_pool(http, proxy)
+                            save_cover(http, self.product, root, self.message.emit)
+                        self.finished_ok.emit('封面已更新'); return
                     if self.action == 'test':
                         with requests.Session() as http:
                             http.trust_env = False
@@ -116,10 +151,25 @@ class Worker(QThread):
         except Exception as error:
             self.failed.emit(f'操作未完成（{type(error).__name__}）；敏感内容已隐藏')
 
+    def fetch_covers(self, helper):
+        products = {'gakumas'} | set(SUPPORTED) | set(records())
+        updated = 0
+        with requests.Session() as http:
+            http.trust_env = False
+            http.proxies = {'http': helper.session.proxy, 'https': helper.session.proxy}
+            attach_pool(http, helper.session.proxy)
+            for product in sorted(products):
+                try:
+                    save_cover(http, product, data_dir(), self.message.emit); updated += 1
+                except DmmError as error:
+                    self.message.emit(f'封面获取失败（{product}）：{error}')
+        return updated, len(products)
+
     def game_action(self, helper):
         if self.action == 'refresh-catalog':
             items = refresh_catalog(helper.session)
-            return f'游戏列表已刷新，共 {len(items)} 款免费下载型游戏'
+            updated, total = self.fetch_covers(helper)
+            return f'游戏列表已刷新，共 {len(items)} 款免费游戏；封面已更新 {updated}/{total} 张'
         if self.action == 'check':
             result = helper.check()
             return f"最新版本 {result['latest_version']} · 待更新 {result['pending_files']} 个文件 · {result['download_bytes'] / 1048576:.1f} MiB"
@@ -145,6 +195,8 @@ class Window(QMainWindow):
         self.worker = None
         self.buttons = []
         self.setWindowTitle('DMM Light · 独立客户端预览版')
+        self.setWindowIcon(app_icon())
+        self.cover_tried = set()
         self.resize(1040, 800)
         outer = QWidget(); self.setCentralWidget(outer)
         layout = QVBoxLayout(outer); layout.setContentsMargins(32, 26, 32, 22); layout.setSpacing(14)
@@ -155,6 +207,7 @@ class Window(QMainWindow):
         self.tabs = QTabWidget(); layout.addWidget(self.tabs, 1)
         game = QWidget(); g = QVBoxLayout(game); g.setContentsMargins(28, 24, 28, 24); g.setSpacing(12)
         title = QLabel('学园偶像大师'); title.setObjectName('section'); g.addWidget(title)
+        self.gakumas_cover = cover_label(); g.addWidget(self.gakumas_cover)
         self.install_label = QLabel(); self.install_label.setObjectName('muted'); self.install_label.setWordWrap(True); g.addWidget(self.install_label)
         hint = QLabel('启动前自动检查、下载并校验更新。更新过程不计入游戏启动倒计时。')
         hint.setObjectName('muted'); hint.setWordWrap(True); g.addWidget(hint)
@@ -167,10 +220,13 @@ class Window(QMainWindow):
         hint = QLabel('无需官方 Player，可直接全新安装到本客户端数据目录。仅支持标准下载型游戏；需要专用安装程序、额外模块或 DRM 授权的游戏会明确提示暂不支持。')
         hint.setObjectName('muted'); hint.setWordWrap(True); g.addWidget(hint)
         self.games = QComboBox(); g.addWidget(self.games)
+        self.games_cover = cover_label(); g.addWidget(self.games_cover)
         row = QHBoxLayout(); row.setSpacing(10); g.addLayout(row)
         self.button(row, '刷新游戏列表', 'refresh-catalog')
         self.button(row, '检查更新', 'game-check'); self.button(row, '安装 / 更新', 'game-update')
         self.button(row, '启动', 'game-launch')
+        hint = QLabel('Fanza（R18）游戏需要已完成年龄认证的 DMM 账号；同一游戏的一般版和 Fanza 版是不同产品，版本各自独立。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); g.addWidget(hint)
         g.addStretch(); self.tabs.addTab(game, '游戏库')
 
         account = QWidget(); a = QVBoxLayout(account); a.setContentsMargins(28, 24, 28, 24); a.setSpacing(12)
@@ -214,6 +270,7 @@ class Window(QMainWindow):
         self.pause = QPushButton('暂停当前操作'); self.pause.setObjectName('pause'); self.pause.setEnabled(False)
         self.pause.clicked.connect(self.cancel); layout.addWidget(self.pause)
         self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(120); layout.addWidget(self.log)
+        self.games.currentIndexChanged.connect(self.on_game_selected)
         self.refresh()
 
     def button(self, layout, label, action, primary=False):
@@ -240,18 +297,40 @@ class Window(QMainWindow):
             known = dict(SUPPORTED)
             known.update({item['product']: item['title'] for item in catalog()})
             known.update({product: value['title'] for product, value in installed.items()})
+            adult = {item['product'] for item in catalog() if item.get('adult')}
             entries = sorted(known.items(), key=lambda item: item[0] not in installed)
             for product, title in entries:
                 record = installed.get(product)
-                label = f"{title} · 已安装（版本 {record['version']}）" if record else f'{title} · 未安装'
+                badge = ' · Fanza R18' if product in adult else ''
+                label = f"{title}{badge} · 已安装（版本 {record['version']}）" if record else f'{title}{badge} · 未安装'
                 self.games.addItem(label, product)
+            self.paint_cover(self.gakumas_cover, 'gakumas')
         except DmmError as error:
             self.status.setText(str(error))
+
+    def paint_cover(self, label, product):
+        path = cover_path(data_dir(), product) if product else None
+        pixmap = QPixmap(str(path)) if path and path.is_file() else QPixmap()
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(label.width() - 4, label.height() - 4,
+                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            label.setText(''); label.setPixmap(rounded_pixmap(scaled))
+        else:
+            label.setPixmap(QPixmap()); label.setText('暂无封面\n选择后自动下载')
+
+    def on_game_selected(self):
+        product = self.games.currentData()
+        if not product: return
+        self.paint_cover(self.games_cover, product)
+        if self.isVisible() and not cover_path(data_dir(), product).is_file() \
+                and product not in self.cover_tried and not (self.worker and self.worker.isRunning()):
+            self.cover_tried.add(product)
+            self.run_action('cover', product)
 
     def cancel(self):
         if self.worker: self.worker.cancelled.set(); self.status.setText('正在暂停并保存下载断点…')
 
-    def run_action(self, action):
+    def run_action(self, action, product=''):
         if self.worker and self.worker.isRunning(): return
         try:
             if action == 'game-folder':
@@ -274,7 +353,7 @@ class Window(QMainWindow):
             else: node_text = self.node_text.text()
             number = self.accounts.currentData() if action == 'switch-account' else self.number.text().strip()
             if action == 'switch-account' and not number: raise DmmError('请先保存并选择账号')
-            product = self.games.currentData() or ''
+            product = product or (self.games.currentData() or '')
             if action.startswith('game-') and not product: raise DmmError('请先选择游戏或刷新游戏列表')
             self.worker = Worker(action, self.settings, number, self.name.text().strip(), node_text, product, self)
             self.worker.message.connect(self.report)
@@ -308,6 +387,7 @@ STYLE = '''QWidget { background:#0b101b; color:#dfe7f3; font-family:"Microsoft Y
     QLabel#section { font-size:16px; font-weight:700; color:#9db8ff; }
     QLabel#muted { color:#8fa1bd; }
     QLabel#status { font-size:15px; font-weight:700; color:#eaf1fb; }
+    QLabel#cover { background:#0e1420; border:1px solid #24304a; border-radius:10px; color:#5a6780; font-weight:600; }
     QTabWidget::pane { border:1px solid #1c2740; border-radius:14px; background:#111827; top:-1px; }
     QTabBar { background:transparent; }
     QTabBar::tab { padding:11px 28px; margin-right:6px; background:transparent; color:#8fa1bd; font-weight:600;

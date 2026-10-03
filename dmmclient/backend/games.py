@@ -5,6 +5,7 @@ import ctypes
 import json
 import re
 import subprocess
+from html import unescape
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -31,26 +32,59 @@ def catalog():
 def refresh_catalog(session):
     session.ensure_login()
     result={}
-    page=1
-    while True:
-        session.cancel_check()
-        query=urlencode({'floor':'free','article':'download:1','limit':120,'sort':'date','os':'win','page':page,'isAdult':'false'})
-        data=session.request('/v5/view/search?'+query,method='GET')
-        items=data.get('list')
-        total=data.get('total_hit_count')
-        if not isinstance(items,list) or not isinstance(total,int) or not 0<=total<=12000:
-            raise DmmError('游戏列表格式不受支持')
-        for item in items:
-            product=checked_product(item['product_id'])
-            title=item.get('title')
-            if not isinstance(title,str) or not title: raise DmmError('游戏名称无效')
-            result[product]={'product':product,'title':title[:240]}
-        if page*120>=total: break
-        if not items or page>=100: raise DmmError('游戏列表分页不完整')
-        page+=1
+    for adult in (False, True):
+        try:
+            page=1
+            while True:
+                session.cancel_check()
+                query=urlencode({'floor':'free','article':'download:1','limit':120,'sort':'date','os':'win','page':page,'isAdult':'true' if adult else 'false'})
+                data=session.request('/v5/view/search?'+query,method='GET')
+                items=data.get('list')
+                total=data.get('total_hit_count')
+                if not isinstance(items,list) or not isinstance(total,int) or not 0<=total<=12000:
+                    raise DmmError('游戏列表格式不受支持')
+                for item in items:
+                    product=checked_product(item['product_id'])
+                    title=item.get('title')
+                    if not isinstance(title,str) or not title: raise DmmError('游戏名称无效')
+                    result[product]={'product':product,'title':title[:240],'adult':adult}
+                if page*120>=total: break
+                if not items or page>=100: raise DmmError('游戏列表分页不完整')
+                page+=1
+        except DmmError as error:
+            if not adult: raise
+            session.progress('Fanza 游戏列表获取失败，已跳过：'+str(error))
     value=list(result.values())
     atomic_write(data_dir()/'catalog.json',json.dumps(value,ensure_ascii=False).encode())
     return value
+
+
+def cover_path(root, product):
+    return root / 'covers' / (checked_product(product) + '.jpg')
+
+
+def save_cover(http, product, root, progress=lambda message: None):
+    """Fetch the game key visual (og:image) from the public detail pages."""
+    checked_product(product)
+    headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'}
+    for base in ('https://games.dmm.com/detail/', 'https://games.dmm.co.jp/detail/'):
+        try:
+            progress('获取游戏封面图')
+            page=http.get(base+product,headers=headers,timeout=(10,30))
+            if page.status_code!=200: raise DmmError(f'详情页 HTTP {page.status_code}')
+            match=re.search(r'<meta property="og:image" content="([^"]+)"',page.text)
+            if not match: raise DmmError('详情页没有封面信息')
+            progress('下载封面图片')
+            image=http.get(unescape(match.group(1)),headers=headers,timeout=(10,60))
+            head=image.content[:12]
+            if image.status_code!=200 or len(image.content)<512 or not (
+                    head[:3]==b'\xff\xd8\xff' or head[:8]==b'\x89PNG\r\n\x1a\n' or head[:4]==b'RIFF'):
+                raise DmmError('封面图片格式无效')
+            atomic_write(cover_path(root,product),image.content)
+            return cover_path(root,product)
+        except (DmmError,requests.RequestException):
+            continue
+    raise DmmError('封面获取失败，请检查代理与日本节点后重试')
 
 
 def records():
