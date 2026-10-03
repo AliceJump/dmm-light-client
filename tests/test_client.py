@@ -43,7 +43,7 @@ class ClientTests(unittest.TestCase):
         app=QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{'LOCALAPPDATA':folder}), patch.object(DmmHelper,'installed_game',return_value=(Path(folder),'1')):
             window=Window()
-            self.assertEqual(window.tabs.count(),3)
+            self.assertEqual(window.tabs.count(),4)
             window.mode.setCurrentIndex(1)
             window.proxy.setText('socks5h://127.0.0.1:10808')
             window.run_action('settings')
