@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import re
 import subprocess
 from html import unescape
@@ -13,7 +14,7 @@ import psutil
 import requests
 
 from .helper import windows_args, ensure_update_idle
-from .session import DmmError, atomic_write, data_dir
+from .session import DmmApiError, DmmError, atomic_write, data_dir
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
 
 SUPPORTED = {'priconner': '公主连结 Re:Dive（日服）'}
@@ -130,7 +131,17 @@ class GameService:
         if kind.get('game_type')!='GCL': raise DmmError('该游戏不是受支持的普通 PC 下载型游戏')
         payload={'product_id':self.product,'game_type':'GCL','game_os':'win',**self.session.device}
         if not installing: payload['launch_type']='LIB'
-        data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
+        try:
+            data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
+        except DmmApiError as error:
+            if error.code==314:
+                # 314 = 游戏不在账号的 DMM 游戏库：官方流程需要在商店页点一次「ゲーム開始」。
+                store=f'https://games.dmm.com/detail/{self.product}'
+                try: os.startfile(store)
+                except OSError: pass
+                raise DmmError(f'DMM 要求先将该游戏加入游戏库：已在浏览器打开商店页 {store}，'
+                               '请点击「ゲームを始める」（可能需要年龄认证），完成后回来重新点「全新安装」') from None
+            raise
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
         if data.get('has_modules'): raise DmmError('该游戏需要额外运行模块，暂不支持自动安装')

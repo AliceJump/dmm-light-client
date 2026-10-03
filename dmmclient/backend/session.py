@@ -31,9 +31,15 @@ class OperationCancelled(DmmError):
 
 
 class DmmApiError(DmmError):
+    HINTS = {203: '登录态已失效', 211: '可能需要年龄认证', 314: '游戏未加入 DMM 游戏库',
+             801: '地区限制，需要日本节点'}
+
     def __init__(self, code):
         self.code = code
-        super().__init__(f"DMM 接口拒绝请求（result_code={code if isinstance(code, int) else 'unknown'}）")
+        hint = self.HINTS.get(code) if isinstance(code, int) else None
+        text = f'DMM 接口拒绝请求（result_code={code if isinstance(code, int) else "unknown"}）'
+        if hint: text += f'：{hint}'
+        super().__init__(text)
 
 
 def data_dir() -> Path:

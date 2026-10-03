@@ -70,6 +70,13 @@ def game_grid():
     return grid
 
 
+def log_error(text):
+    try:
+        with (data_dir() / 'client.log').open('a', encoding='utf-8', errors='replace') as stream:
+            stream.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {text}\n')
+    except OSError: pass
+
+
 class Worker(QThread):
     message = Signal(str)
     download = Signal(int, str)
@@ -147,8 +154,10 @@ class Worker(QThread):
                             result = self.game_action(helper)
                     self.finished_ok.emit(result)
         except (DmmError, requests.RequestException) as error:
+            log_error(f'操作失败 action={self.action} product={self.product or "-"}: {error}')
             self.failed.emit(str(error) if isinstance(error, DmmError) else '网络连接失败，请测试代理或切换节点')
         except Exception as error:
+            log_error(f'操作异常 action={self.action} product={self.product or "-"}: {traceback.format_exc()}')
             self.failed.emit(f'操作未完成（{type(error).__name__}）；敏感内容已隐藏')
 
     def fetch_covers(self, helper):
@@ -468,7 +477,8 @@ class Window(QMainWindow):
             if Shiboken.isValid(control): control.setEnabled(not busy)
 
     def run_action(self, action, product=''):
-        if self.worker and self.worker.isRunning(): return
+        if self.worker and self.worker.isRunning():
+            self.report('已有操作正在进行，请等它结束或点「暂停当前操作」'); return
         try:
             if action == 'game-folder':
                 folder = QFileDialog.getExistingDirectory(self, '选择含 gakumas.exe 的游戏目录')
@@ -496,7 +506,6 @@ class Window(QMainWindow):
             self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
             self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
             self.worker.finished.connect(self.operation_finished)
-            self.set_busy(False)
             self.pause.setEnabled(True); self.bar.setRange(0,0)
             self.status.setText('正在处理…'); self.worker.start()
         except (DmmError, OSError, UnicodeError) as error:
@@ -507,8 +516,11 @@ class Window(QMainWindow):
     def report(self, message):
         self.status.setText(message); self.log.append(message)
 
+    def set_busy(self, busy):
+        """兼容保留：操作期间不再禁用全局控件，仅由 run_action 提示占用。"""
+        self.pause.setEnabled(not busy)
+
     def operation_finished(self):
-        self.set_busy(True)
         self.pause.setEnabled(False); self.bar.setRange(0,100); self.node_text.clear(); self.refresh()
         self.worker.deleteLater(); self.worker = None
 
