@@ -267,6 +267,8 @@ class DmmSession:
             raise DmmError("DMM 返回了无法识别的响应") from None
         code = result.get("result_code")
         if code != 100 and result.get("result") != "success":
+            if code == 203:  # 登录态在操作中途失效：走浏览器登录重试，而不是报"拒绝请求"
+                raise LoginRequired("登录态已失效，请在浏览器完成登录")
             raise DmmApiError(code)
         data = result.get("data")
         if isinstance(data, dict) and data.get("access_token_info") is not None:
@@ -292,7 +294,12 @@ class DmmSession:
         payload = {"access_token": self.auth["accessToken"]}
         if "expiresInSeconds" in self.auth:
             payload["expires_in_seconds"] = self.auth["expiresInSeconds"]
-        result = self.request("/v5/auth/accesstoken/check", payload)
+        try:
+            result = self.request("/v5/auth/accesstoken/check", payload)
+        except LoginRequired:
+            return False  # token 已失效：交给 ensure_login 的续期流程
+        except DmmApiError:
+            return False
         return isinstance(result, dict) and result.get("result") is True
 
     def ensure_login(self):

@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import psutil
+import requests
 
 from .helper import windows_args, ensure_update_idle
 from .session import DmmError, atomic_write, data_dir
@@ -47,7 +48,9 @@ def refresh_catalog(session):
                     product=checked_product(item['product_id'])
                     title=item.get('title')
                     if not isinstance(title,str) or not title: raise DmmError('游戏名称无效')
-                    result[product]={'product':product,'title':title[:240],'adult':adult}
+                    image=item.get('image_url')
+                    result[product]={'product':product,'title':title[:240],'adult':adult,
+                                     'image_url':image if isinstance(image,str) and image.startswith('http') else ''}
                 if page*120>=total: break
                 if not items or page>=100: raise DmmError('游戏列表分页不完整')
                 page+=1
@@ -63,10 +66,36 @@ def cover_path(root, product):
     return root / 'covers' / (checked_product(product) + '.jpg')
 
 
+def catalog_image_url(product):
+    """Cover URL provided by the search API; far more reliable than the detail page."""
+    try:
+        for item in catalog():
+            if item['product'] == product: return item.get('image_url') or None
+    except (DmmError, ValueError): pass
+    return None
+
+
 def save_cover(http, product, root, progress=lambda message: None):
-    """Fetch the game key visual (og:image) from the public detail pages."""
+    """Fetch the game key visual: prefer the API image_url, fall back to detail pages."""
     checked_product(product)
     headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'}
+
+    def grab(url):
+        image=http.get(url,headers=headers,timeout=(10,60))
+        head=image.content[:12]
+        if image.status_code!=200 or len(image.content)<512 or not (
+                head[:3]==b'\xff\xd8\xff' or head[:8]==b'\x89PNG\r\n\x1a\n'
+                or head[:4]==b'GIF8' or head[:4]==b'RIFF'):
+            raise DmmError('封面图片格式无效')
+        atomic_write(cover_path(root,product),image.content)
+        return cover_path(root,product)
+
+    direct=catalog_image_url(product)
+    if direct:
+        try:
+            progress('下载封面图片')
+            return grab(direct)
+        except (DmmError,requests.RequestException): pass
     for base in ('https://games.dmm.com/detail/', 'https://games.dmm.co.jp/detail/'):
         try:
             progress('获取游戏封面图')
@@ -75,16 +104,10 @@ def save_cover(http, product, root, progress=lambda message: None):
             match=re.search(r'<meta property="og:image" content="([^"]+)"',page.text)
             if not match: raise DmmError('详情页没有封面信息')
             progress('下载封面图片')
-            image=http.get(unescape(match.group(1)),headers=headers,timeout=(10,60))
-            head=image.content[:12]
-            if image.status_code!=200 or len(image.content)<512 or not (
-                    head[:3]==b'\xff\xd8\xff' or head[:8]==b'\x89PNG\r\n\x1a\n' or head[:4]==b'RIFF'):
-                raise DmmError('封面图片格式无效')
-            atomic_write(cover_path(root,product),image.content)
-            return cover_path(root,product)
+            return grab(unescape(match.group(1)))
         except (DmmError,requests.RequestException):
             continue
-    raise DmmError('封面获取失败，请检查代理与日本节点后重试')
+    raise DmmError('封面获取失败，请刷新游戏列表后重试')
 
 
 def records():

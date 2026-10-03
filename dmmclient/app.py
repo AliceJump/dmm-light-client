@@ -160,9 +160,9 @@ class Worker(QThread):
             attach_pool(http, helper.session.proxy)
             for product in sorted(products):
                 try:
-                    save_cover(http, product, data_dir(), self.message.emit); updated += 1
-                except DmmError as error:
-                    self.message.emit(f'封面获取失败（{product}）：{error}')
+                    save_cover(http, product, data_dir()); updated += 1
+                except DmmError:
+                    continue  # 缺封面静默跳过，后台 CoverWorker 之后还会补
         return updated, len(products)
 
     def game_action(self, helper):
