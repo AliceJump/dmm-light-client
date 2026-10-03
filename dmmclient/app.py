@@ -1,10 +1,12 @@
 """Independent Qt client: no ok-script imports or automation tasks."""
 from __future__ import annotations
 
+import faulthandler
 import json
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import requests
@@ -14,6 +16,7 @@ from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QPainter, QPai
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QProgressBar,
     QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+from shiboken6 import Shiboken
 
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
@@ -218,8 +221,10 @@ class Window(QMainWindow):
         self.worker = None
         self.cover_worker = None
         self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
-        self.card_buttons = []     # 当前卡片上的按钮（随网格重建）
-        self.cover_labels = {}     # product -> [QLabel]
+        self.library_buttons = []  # 车库卡片按钮（随网格重建）
+        self.store_buttons = []    # 商店卡片按钮（随网格重建）
+        self.library_covers = {}   # product -> [QLabel]，随网格重建
+        self.store_covers = {}
         self.cover_tried = set()
         self.setWindowTitle('DMM Light · 独立客户端预览版')
         self.setWindowIcon(app_icon())
@@ -315,7 +320,7 @@ class Window(QMainWindow):
 
     # ---------- 卡片 ----------
 
-    def make_card(self, product, title, state, buttons, extra=()):
+    def make_card(self, grid, buttons, covers, product, title, state, card_buttons, extra=()):
         card = QWidget(); card.setObjectName('card'); card.setFixedSize(226, 280)
         box = QVBoxLayout(card); box.setContentsMargins(10, 10, 10, 12); box.setSpacing(7)
         cover = QLabel('暂无封面'); cover.setObjectName('cover'); cover.setAlignment(Qt.AlignCenter)
@@ -326,18 +331,25 @@ class Window(QMainWindow):
         info = QLabel(state); info.setObjectName('muted'); info.setWordWrap(True); box.addWidget(info)
         box.addStretch()
         row = QHBoxLayout(); row.setSpacing(6); box.addLayout(row)
-        for text, action, accent in list(buttons) + list(extra):
+        for text, action, accent in list(card_buttons) + list(extra):
             button = QPushButton(text); button.setObjectName('mini')
             if accent: button.setProperty('accent', True)
             button.clicked.connect(lambda _, a=action, p=product: self.run_action(a, p))
-            row.addWidget(button); self.card_buttons.append(button)
-        self.cover_labels.setdefault(product, []).append(cover)
+            row.addWidget(button); buttons.append(button)
+        covers.setdefault(product, []).append(cover)
         if cover_path(data_dir(), product).is_file(): self.paint_cover(cover, product)
         return card
 
     def add_card(self, grid, card):
         item = QListWidgetItem(); item.setSizeHint(QSize(234, 288))
         grid.addItem(item); grid.setItemWidget(item, card)
+
+    def all_covers(self):
+        merged = {}
+        for source in (self.library_covers, self.store_covers):
+            for product, labels in source.items():
+                merged.setdefault(product, []).extend(labels)
+        return merged
 
     def known_titles(self):
         titles = {'gakumas': '学园偶像大师'}
@@ -347,25 +359,27 @@ class Window(QMainWindow):
         return titles
 
     def repopulate_library(self):
-        self.library_grid.clear()
+        self.library_grid.clear(); self.library_buttons = []; self.library_covers = {}
         installed = records()
         try:
             _, version = DmmHelper.installed_game()
             state = f'已安装 · 版本 {version}'
         except DmmError:
             state = '未识别官方安装记录'
-        self.add_card(self.library_grid, self.make_card('gakumas', '学园偶像大师', state,
+        self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
+            self.library_covers, 'gakumas', '学园偶像大师', state,
             [('启动', 'launch', True), ('检查', 'check', False), ('更新', 'update', False)],
             extra=[('选择游戏目录', 'game-folder', False)]))
         titles = self.known_titles()
         for product, value in sorted(installed.items()):
             title = titles.get(product, product)
-            self.add_card(self.library_grid, self.make_card(product, title,
+            self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
+                self.library_covers, product, title,
                 f"已安装 · 版本 {value.get('version', '未知')}",
                 [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False)]))
 
     def repopulate_store(self):
-        self.store_grid.clear()
+        self.store_grid.clear(); self.store_buttons = []; self.store_covers = {}
         installed = records()
         titles = self.known_titles()
         adult = {item['product'] for item in catalog() if item.get('adult')}
@@ -384,12 +398,12 @@ class Window(QMainWindow):
                     [('启动', 'game-launch', True), ('更新', 'game-update', False)]
             else:
                 state, buttons = badge + '未安装 · 可全新安装', [('全新安装', 'game-update', True)]
-            self.add_card(self.store_grid, self.make_card(product, title, state, buttons))
+            self.add_card(self.store_grid, self.make_card(self.store_grid, self.store_buttons,
+                self.store_covers, product, title, state, buttons))
 
     # ---------- 刷新与封面 ----------
 
     def refresh(self):
-        self.card_buttons = []; self.cover_labels = {}
         try:
             self.repopulate_library(); self.repopulate_store()
             value = AccountStore(data_dir()).read()
@@ -404,6 +418,8 @@ class Window(QMainWindow):
                     self.nodes.addItem(node['name'] + (' · 已启用' if node['enabled'] else ' · 已停用'), node['id'])
         except DmmError as error:
             self.status.setText(str(error))
+        except Exception:
+            self.report('界面数据加载失败，详情见 client.log'); raise
         self.kick_covers()
 
     def paint_cover(self, label, product):
@@ -418,7 +434,8 @@ class Window(QMainWindow):
 
     def kick_covers(self):
         if not self.isVisible() or (self.cover_worker and self.cover_worker.isRunning()): return
-        missing = sorted(product for product in self.cover_labels
+        products = self.all_covers()
+        missing = sorted(product for product in products
                          if product not in self.cover_tried and not cover_path(data_dir(), product).is_file())
         if not missing: return
         for product in missing: self.cover_tried.add(product)
@@ -427,7 +444,7 @@ class Window(QMainWindow):
         self.cover_worker.start()
 
     def cover_arrived(self, product):
-        for label in self.cover_labels.get(product, []): self.paint_cover(label, product)
+        for label in self.all_covers().get(product, []): self.paint_cover(label, product)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -445,8 +462,10 @@ class Window(QMainWindow):
 
     def set_busy(self, busy):
         controls = [self.mode, self.proxy, self.accounts, self.number, self.name,
-                    self.node_text, self.search, self.filter_box] + self.buttons + self.card_buttons
-        for control in controls: control.setEnabled(not busy)
+                    self.node_text, self.search, self.filter_box] + self.buttons \
+                   + self.library_buttons + self.store_buttons
+        for control in controls:
+            if Shiboken.isValid(control): control.setEnabled(not busy)
 
     def run_action(self, action, product=''):
         if self.worker and self.worker.isRunning(): return
@@ -482,6 +501,8 @@ class Window(QMainWindow):
             self.status.setText('正在处理…'); self.worker.start()
         except (DmmError, OSError, UnicodeError) as error:
             self.report(str(error) if isinstance(error,DmmError) else '配置文件无法读取')
+        except Exception:
+            self.report('操作未能开始，详情见 client.log'); raise
 
     def report(self, message):
         self.status.setText(message); self.log.append(message)
@@ -550,11 +571,31 @@ STYLE = '''QWidget { background:#0b101b; color:#dfe7f3; font-family:"Microsoft Y
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }'''
 
 
+def setup_logging():
+    """pythonw has no console; any uncaught error must land in client.log."""
+    root = data_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    stream = (root / 'client.log').open('a', buffering=1, encoding='utf-8', errors='replace')
+    stream.write(f'\n--- 启动 {time.strftime("%Y-%m-%d %H:%M:%S")} ---\n')
+    if sys.stdout is None or sys.stderr is None:
+        sys.stdout = sys.stderr = stream
+    faulthandler.enable(stream)
+    sys.excepthook = lambda t, v, tb: stream.write(''.join(traceback.format_exception(t, v, tb)))
+    threading.excepthook = lambda args: stream.write(
+        ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+    return stream
+
+
 def main():
-    app = QApplication(sys.argv)
-    app.setStyleSheet(STYLE)
-    window = Window(); window.show()
-    return app.exec()
+    log = setup_logging()
+    try:
+        app = QApplication(sys.argv)
+        app.setStyleSheet(STYLE)
+        window = Window(); window.show()
+        return app.exec()
+    except BaseException:
+        log.write(traceback.format_exc())
+        raise
 
 
 if __name__ == '__main__':
