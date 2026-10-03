@@ -9,7 +9,7 @@ from pathlib import Path
 
 import requests
 from PySide6.QtCore import QThread, Signal
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QProgressBar, QPushButton,
     QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
@@ -28,6 +28,11 @@ def load_settings():
     if path.exists():
         defaults.update(json.loads(path.read_text(encoding='utf-8')))
     return defaults
+
+
+def divider():
+    line = QFrame(); line.setObjectName('divider'); line.setFrameShape(QFrame.HLine); line.setFixedHeight(1)
+    return line
 
 
 class Worker(QThread):
@@ -140,63 +145,75 @@ class Window(QMainWindow):
         self.worker = None
         self.buttons = []
         self.setWindowTitle('DMM Light · 独立客户端预览版')
-        self.resize(1000, 760)
+        self.resize(1040, 800)
         outer = QWidget(); self.setCentralWidget(outer)
-        layout = QVBoxLayout(outer); layout.setContentsMargins(28, 24, 28, 24); layout.setSpacing(14)
-        heading = QLabel('DMM Light'); heading.setObjectName('heading'); layout.addWidget(heading)
-        layout.addWidget(QLabel('游戏、账号与下载，在一个独立客户端中管理'))
+        layout = QVBoxLayout(outer); layout.setContentsMargins(32, 26, 32, 22); layout.setSpacing(14)
+        brand = QVBoxLayout(); brand.setSpacing(2)
+        heading = QLabel('DMM Light'); heading.setObjectName('heading'); brand.addWidget(heading)
+        tagline = QLabel('游戏、账号与下载，在一个独立客户端中管理'); tagline.setObjectName('tagline'); brand.addWidget(tagline)
+        layout.addLayout(brand)
         self.tabs = QTabWidget(); layout.addWidget(self.tabs, 1)
-        game = QWidget(); g = QVBoxLayout(game); g.setContentsMargins(24, 24, 24, 24)
-        title = QLabel('学园偶像大师'); title.setObjectName('subtitle'); g.addWidget(title)
-        self.install_label = QLabel(); self.install_label.setWordWrap(True); g.addWidget(self.install_label)
-        g.addWidget(QLabel('启动前自动检查、下载并校验更新。更新过程不计入游戏启动倒计时。'))
-        row = QHBoxLayout(); g.addLayout(row)
+        game = QWidget(); g = QVBoxLayout(game); g.setContentsMargins(28, 24, 28, 24); g.setSpacing(12)
+        title = QLabel('学园偶像大师'); title.setObjectName('section'); g.addWidget(title)
+        self.install_label = QLabel(); self.install_label.setObjectName('muted'); self.install_label.setWordWrap(True); g.addWidget(self.install_label)
+        hint = QLabel('启动前自动检查、下载并校验更新。更新过程不计入游戏启动倒计时。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); g.addWidget(hint)
+        row = QHBoxLayout(); row.setSpacing(10); g.addLayout(row)
         self.button(row, '启动游戏', 'launch', primary=True)
         self.button(row, '检查更新', 'check'); self.button(row, '更新 / 继续下载', 'update')
         self.button(row, '选择游戏目录', 'game-folder')
-        g.addWidget(QLabel('其他免费下载型游戏：无需官方 Player，可直接全新安装到本客户端数据目录。'))
+        g.addWidget(divider())
+        title = QLabel('更多游戏'); title.setObjectName('section'); g.addWidget(title)
+        hint = QLabel('无需官方 Player，可直接全新安装到本客户端数据目录。仅支持标准下载型游戏；需要专用安装程序、额外模块或 DRM 授权的游戏会明确提示暂不支持。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); g.addWidget(hint)
         self.games = QComboBox(); g.addWidget(self.games)
-        row = QHBoxLayout(); g.addLayout(row)
+        row = QHBoxLayout(); row.setSpacing(10); g.addLayout(row)
         self.button(row, '刷新游戏列表', 'refresh-catalog')
         self.button(row, '检查更新', 'game-check'); self.button(row, '安装 / 更新', 'game-update')
         self.button(row, '启动', 'game-launch')
-        g.addWidget(QLabel('仅支持标准下载型游戏；需要专用安装程序、额外模块或 DRM 授权的游戏会明确提示暂不支持。'))
         g.addStretch(); self.tabs.addTab(game, '游戏库')
 
-        account = QWidget(); a = QVBoxLayout(account); a.setContentsMargins(24, 24, 24, 24)
-        a.addWidget(QLabel('登录状态加密保存在本客户端的数据目录；切换前需要关闭游戏。'))
+        account = QWidget(); a = QVBoxLayout(account); a.setContentsMargins(28, 24, 28, 24); a.setSpacing(12)
+        title = QLabel('账号管理'); title.setObjectName('section'); a.addWidget(title)
+        hint = QLabel('登录状态加密保存在本客户端的数据目录；切换前需要关闭游戏。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); a.addWidget(hint)
         self.accounts = QComboBox(); a.addWidget(self.accounts)
-        form = QFormLayout(); self.number = QLineEdit(); self.name = QLineEdit()
+        form = QFormLayout(); form.setSpacing(10); self.number = QLineEdit(); self.name = QLineEdit()
         form.addRow('账号编号', self.number); form.addRow('显示名称', self.name); a.addLayout(form)
-        row = QHBoxLayout(); a.addLayout(row)
+        row = QHBoxLayout(); row.setSpacing(10); a.addLayout(row)
         self.button(row, '登录新账号', 'new-account'); self.button(row, '保存当前账号', 'save-account')
         self.button(row, '切换所选账号', 'switch-account')
-        row = QHBoxLayout(); a.addLayout(row)
+        a.addWidget(divider())
+        row = QHBoxLayout(); row.setSpacing(10); a.addLayout(row)
         self.button(row, '浏览器登录 / 续期', 'login'); self.button(row, '导入官方客户端登录态', 'import-login')
-        a.addWidget(QLabel('密码与验证码只在 DMM 官方网页输入。登录成功后复制成功页地址即可返回客户端。'))
+        hint = QLabel('密码与验证码只在 DMM 官方网页输入。登录成功后复制成功页地址即可返回客户端。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); a.addWidget(hint)
         a.addStretch(); self.tabs.addTab(account, '账号')
 
-        network = QWidget(); n = QVBoxLayout(network); n.setContentsMargins(24, 24, 24, 24)
+        network = QWidget(); n = QVBoxLayout(network); n.setContentsMargins(28, 24, 28, 24); n.setSpacing(12)
+        title = QLabel('代理与节点'); title.setObjectName('section'); n.addWidget(title)
         self.mode = QComboBox(); self.mode.addItems(['内置 Xray 节点池', '外部代理地址'])
         self.mode.setCurrentIndex(0 if self.settings[NODE_ENABLED_KEY] else 1); n.addWidget(self.mode)
         self.proxy = QLineEdit(self.settings['proxy']); self.proxy.setPlaceholderText('http://127.0.0.1:10808 或 socks5h://127.0.0.1:10808'); n.addWidget(self.proxy)
-        n.addWidget(QLabel('外部代理也用于首次下载 Xray 内核；已有内核时，内置模式不依赖 v2rayN。'))
-        row = QHBoxLayout(); n.addLayout(row)
+        hint = QLabel('外部代理也用于首次下载 Xray 内核；已有内核时，内置模式不依赖 v2rayN。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
+        row = QHBoxLayout(); row.setSpacing(10); n.addLayout(row)
         self.button(row, '保存代理设置', 'settings'); self.button(row, '测试 DMM 连接', 'test')
         self.nodes = QComboBox(); n.addWidget(self.nodes)
         self.node_text = QLineEdit(); self.node_text.setEchoMode(QLineEdit.EchoMode.Password)
         self.node_text.setPlaceholderText('粘贴节点分享链接或单节点 Xray JSON，内容隐藏'); n.addWidget(self.node_text)
-        row = QHBoxLayout(); n.addLayout(row)
+        row = QHBoxLayout(); row.setSpacing(10); n.addLayout(row)
         self.button(row, '添加节点', 'import-node'); self.button(row, '导入 JSON 文件', 'node-file')
-        n.addWidget(QLabel('最多 32 个节点，轮换使用，连接失败自动尝试下一节点。\n浏览器登录使用 HTTP 代理或内置节点池；SOCKS5 支持 API、更新和下载。'))
+        hint = QLabel('最多 32 个节点，轮换使用，连接失败自动尝试下一节点。\n浏览器登录使用 HTTP 代理或内置节点池；SOCKS5 支持 API、更新和下载。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
         n.addStretch(); self.tabs.addTab(network, '网络')
 
-        self.status = QLabel('就绪'); self.status.setWordWrap(True); layout.addWidget(self.status)
+        self.status = QLabel('就绪'); self.status.setObjectName('status'); self.status.setWordWrap(True); layout.addWidget(self.status)
         self.bar = QProgressBar(); self.bar.setValue(0); layout.addWidget(self.bar)
-        self.stats = QLabel(''); layout.addWidget(self.stats)
-        self.pause = QPushButton('暂停当前操作'); self.pause.setEnabled(False)
+        self.stats = QLabel(''); self.stats.setObjectName('muted'); layout.addWidget(self.stats)
+        self.pause = QPushButton('暂停当前操作'); self.pause.setObjectName('pause'); self.pause.setEnabled(False)
         self.pause.clicked.connect(self.cancel); layout.addWidget(self.pause)
-        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(110); layout.addWidget(self.log)
+        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(120); layout.addWidget(self.log)
         self.refresh()
 
     def button(self, layout, label, action, primary=False):
@@ -284,16 +301,49 @@ class Window(QMainWindow):
         else: event.accept()
 
 
+STYLE = '''QWidget { background:#0b101b; color:#dfe7f3; font-family:"Microsoft YaHei UI"; font-size:14px; }
+    QLabel { background:transparent; }
+    QLabel#heading { font-size:34px; font-weight:800; color:#ffffff; letter-spacing:1px; }
+    QLabel#tagline { font-size:14px; color:#8fa1bd; }
+    QLabel#section { font-size:16px; font-weight:700; color:#9db8ff; }
+    QLabel#muted { color:#8fa1bd; }
+    QLabel#status { font-size:15px; font-weight:700; color:#eaf1fb; }
+    QTabWidget::pane { border:1px solid #1c2740; border-radius:14px; background:#111827; top:-1px; }
+    QTabBar { background:transparent; }
+    QTabBar::tab { padding:11px 28px; margin-right:6px; background:transparent; color:#8fa1bd; font-weight:600;
+        border:1px solid transparent; border-bottom:none; border-top-left-radius:10px; border-top-right-radius:10px; }
+    QTabBar::tab:selected { background:#111827; color:#ffffff; border-color:#1c2740; }
+    QTabBar::tab:hover:!selected { color:#c4d2ea; }
+    QPushButton { background:#1a2334; border:1px solid #26334c; border-radius:10px; padding:10px 18px; color:#dfe7f3; font-weight:600; }
+    QPushButton:hover { background:#22304a; border-color:#33456a; }
+    QPushButton:pressed { background:#182135; }
+    QPushButton:disabled { background:#141c2b; border-color:#1f2a40; color:#5a6780; }
+    QPushButton#primary { border:none; color:#ffffff; padding:11px 22px;
+        background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4d7dff, stop:1 #7a5cff); }
+    QPushButton#primary:hover { background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #6290ff, stop:1 #8f74ff); }
+    QPushButton#primary:pressed { background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #3f6ae6, stop:1 #6a4de0); }
+    QPushButton#primary:disabled { background:#2a3550; color:#7286a8; }
+    QLineEdit, QComboBox { background:#0e1420; border:1px solid #24304a; border-radius:9px; padding:9px 12px;
+        color:#e7eef9; selection-background-color:#4d7dff; selection-color:#ffffff; }
+    QLineEdit:focus, QComboBox:focus { border:1px solid #5b8cff; background:#101827; }
+    QLineEdit:disabled, QComboBox:disabled { color:#5a6780; background:#10151f; border-color:#1c2740; }
+    QComboBox::drop-down { border:none; width:28px; }
+    QComboBox::down-arrow { image:none; border-left:5px solid transparent; border-right:5px solid transparent;
+        border-top:6px solid #8fa1bd; margin-right:12px; }
+    QComboBox QAbstractItemView { background:#131b2b; border:1px solid #26334c; border-radius:8px;
+        selection-background-color:#233355; selection-color:#ffffff; outline:none; }
+    QProgressBar { background:#0e1420; border:1px solid #24304a; border-radius:8px; text-align:center;
+        color:#dfe7f3; font-weight:600; min-height:16px; }
+    QProgressBar::chunk { border-radius:7px;
+        background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #4d7dff, stop:1 #7a5cff); }
+    QTextEdit { background:#0d1220; border:1px solid #1f2a40; border-radius:10px; padding:6px;
+        color:#a8b8d4; font-family:"Consolas","Microsoft YaHei UI"; font-size:12px; }
+    QFrame#divider { border:none; background:#1c2740; max-height:1px; }'''
+
+
 def main():
     app = QApplication(sys.argv)
-    app.setStyleSheet('''QWidget { background:#101827; color:#e4eaf4; font-family:"Microsoft YaHei"; font-size:14px; }
-        QLabel#heading { font-size:30px; font-weight:700; } QLabel#subtitle { font-size:24px; font-weight:600; }
-        QPushButton { background:#24324a; border:1px solid #344563; border-radius:8px; padding:10px 16px; }
-        QPushButton:hover { background:#334868; } QPushButton#primary { background:#466cff; }
-        QPushButton:disabled { color:#66748a; } QLineEdit,QComboBox,QTextEdit { background:#182338; border:1px solid #344563; border-radius:6px; padding:8px; }
-        QTabWidget::pane { border:1px solid #27374f; border-radius:8px; } QTabBar::tab { padding:12px 24px; background:#182338; }
-        QTabBar::tab:selected { background:#304469; } QProgressBar { border:1px solid #344563; border-radius:5px; text-align:center; }
-        QProgressBar::chunk { background:#466cff; }''')
+    app.setStyleSheet(STYLE)
     window = Window(); window.show()
     return app.exec()
 
