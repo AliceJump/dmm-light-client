@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout
 
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
+from .backend.games import SUPPORTED, GameService, catalog, records, refresh_catalog
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import DmmError, LoginRequired, OperationCancelled, atomic_write, data_dir, valid_proxy
@@ -35,10 +36,11 @@ class Worker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, action, settings, number='', name='', node_text='', parent=None):
+    def __init__(self, action, settings, number='', name='', node_text='', product='', parent=None):
         super().__init__(parent)
         self.action, self.settings = action, dict(settings)
         self.number, self.name, self.node_text = number, name, node_text
+        self.product = product
         self.cancelled = threading.Event()
         self.start_time = time.monotonic()
 
@@ -110,6 +112,9 @@ class Worker(QThread):
             self.failed.emit(f'操作未完成（{type(error).__name__}）；敏感内容已隐藏')
 
     def game_action(self, helper):
+        if self.action == 'refresh-catalog':
+            items = refresh_catalog(helper.session)
+            return f'游戏列表已刷新，共 {len(items)} 款免费下载型游戏'
         if self.action == 'check':
             result = helper.check()
             return f"最新版本 {result['latest_version']} · 待更新 {result['pending_files']} 个文件 · {result['download_bytes'] / 1048576:.1f} MiB"
@@ -119,6 +124,12 @@ class Worker(QThread):
         if self.action == 'launch':
             helper.launch(True)
             return '游戏进程已启动；请确认游戏内登录完成'
+        if self.action in {'game-check', 'game-update', 'game-launch'}:
+            action = self.action.removeprefix('game-')
+            if action == 'update' and self.product not in records():
+                action = 'install'  # 未安装过的游戏直接全新安装
+            service = GameService(helper.session, self.product, self.message.emit, self.progress)
+            return service.execute(action)
         raise DmmError('未知操作')
 
 
@@ -143,8 +154,14 @@ class Window(QMainWindow):
         self.button(row, '启动游戏', 'launch', primary=True)
         self.button(row, '检查更新', 'check'); self.button(row, '更新 / 继续下载', 'update')
         self.button(row, '选择游戏目录', 'game-folder')
-        g.addStretch(); g.addWidget(QLabel('预览版目前支持已安装的学园偶像大师。其他游戏与全新安装尚未开放。'))
-        self.tabs.addTab(game, '游戏库')
+        g.addWidget(QLabel('其他免费下载型游戏：无需官方 Player，可直接全新安装到本客户端数据目录。'))
+        self.games = QComboBox(); g.addWidget(self.games)
+        row = QHBoxLayout(); g.addLayout(row)
+        self.button(row, '刷新游戏列表', 'refresh-catalog')
+        self.button(row, '检查更新', 'game-check'); self.button(row, '安装 / 更新', 'game-update')
+        self.button(row, '启动', 'game-launch')
+        g.addWidget(QLabel('仅支持标准下载型游戏；需要专用安装程序、额外模块或 DRM 授权的游戏会明确提示暂不支持。'))
+        g.addStretch(); self.tabs.addTab(game, '游戏库')
 
         account = QWidget(); a = QVBoxLayout(account); a.setContentsMargins(24, 24, 24, 24)
         a.addWidget(QLabel('登录状态加密保存在本客户端的数据目录；切换前需要关闭游戏。'))
@@ -201,6 +218,16 @@ class Window(QMainWindow):
             if store.path.exists():
                 for node in store.read()['nodes']:
                     self.nodes.addItem(node['name'] + (' · 已启用' if node['enabled'] else ' · 已停用'), node['id'])
+            self.games.clear()
+            installed = records()
+            known = dict(SUPPORTED)
+            known.update({item['product']: item['title'] for item in catalog()})
+            known.update({product: value['title'] for product, value in installed.items()})
+            entries = sorted(known.items(), key=lambda item: item[0] not in installed)
+            for product, title in entries:
+                record = installed.get(product)
+                label = f"{title} · 已安装（版本 {record['version']}）" if record else f'{title} · 未安装'
+                self.games.addItem(label, product)
         except DmmError as error:
             self.status.setText(str(error))
 
@@ -230,12 +257,14 @@ class Window(QMainWindow):
             else: node_text = self.node_text.text()
             number = self.accounts.currentData() if action == 'switch-account' else self.number.text().strip()
             if action == 'switch-account' and not number: raise DmmError('请先保存并选择账号')
-            self.worker = Worker(action, self.settings, number, self.name.text().strip(), node_text, self)
+            product = self.games.currentData() or ''
+            if action.startswith('game-') and not product: raise DmmError('请先选择游戏或刷新游戏列表')
+            self.worker = Worker(action, self.settings, number, self.name.text().strip(), node_text, product, self)
             self.worker.message.connect(self.report)
             self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
             self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
             self.worker.finished.connect(self.operation_finished)
-            for control in self.buttons + [self.mode,self.proxy,self.accounts,self.number,self.name,self.node_text]: control.setEnabled(False)
+            for control in self.buttons + [self.mode,self.proxy,self.accounts,self.number,self.name,self.node_text,self.games]: control.setEnabled(False)
             self.pause.setEnabled(True); self.bar.setRange(0,0)
             self.status.setText('正在处理…'); self.worker.start()
         except (DmmError, OSError, UnicodeError) as error:
@@ -245,7 +274,7 @@ class Window(QMainWindow):
         self.status.setText(message); self.log.append(message)
 
     def operation_finished(self):
-        for control in self.buttons + [self.mode,self.proxy,self.accounts,self.number,self.name,self.node_text]: control.setEnabled(True)
+        for control in self.buttons + [self.mode,self.proxy,self.accounts,self.number,self.name,self.node_text,self.games]: control.setEnabled(True)
         self.pause.setEnabled(False); self.bar.setRange(0,100); self.node_text.clear(); self.refresh()
         self.worker.deleteLater(); self.worker = None
 
