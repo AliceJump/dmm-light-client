@@ -14,18 +14,10 @@ import psutil
 import requests
 
 from .helper import windows_args, ensure_update_idle
-from .session import DmmApiError, DmmError, atomic_write, data_dir
+from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
 
 SUPPORTED = {'priconner': '公主连结 Re:Dive（日服）'}
-
-
-class StorePageNeeded(DmmError):
-    """314：该游戏还不在账号的 DMM 游戏库，需要先在商店页点一次「ゲーム開始」。"""
-    def __init__(self, url):
-        self.url = url
-        super().__init__('DMM 要求先将该游戏加入游戏库：已在本客户端「商店页」打开详情页，'
-                         '请在页面点击「ゲームを始める」（可能需要年龄认证），完成后重新点「全新安装」')
 
 
 def checked_product(value):
@@ -88,6 +80,44 @@ def catalog_image_url(product):
             if item['product'] == product: return item.get('image_url') or None
     except (DmmError, ValueError): pass
     return None
+
+
+def official_record(product):
+    """官方 Player（dmmgame.cnf）里已安装的同款游戏记录，可被本客户端接管更新与启动。"""
+    try:
+        config=json.loads((dmm_dir()/'dmmgame.cnf').read_text(encoding='utf-8'))
+        entry=next(item for item in config['contents'] if item.get('productId')==product)
+        detail=entry.get('detail') or {}
+        if not detail.get('installed') or entry.get('gameType')!='GCL': return None
+        root=detail.get('path')
+        if not root: return None
+        return {'root':str(root),'version':str(detail.get('version','未知')),'title':str(detail.get('title') or product)}
+    except Exception:
+        return None
+
+
+def installed_record(product):
+    """本客户端或官方 Player 安装过的游戏记录（gakumas 走专用流程，不在此列）。"""
+    return records().get(product) or official_record(product)
+
+
+def official_records():
+    """官方 Player 里全部已安装的 GCL 游戏。"""
+    result={}
+    try:
+        config=json.loads((dmm_dir()/'dmmgame.cnf').read_text(encoding='utf-8'))
+        for entry in config.get('contents',[]):
+            product=entry.get('productId')
+            detail=entry.get('detail') or {}
+            if not product or not detail.get('installed') or entry.get('gameType')!='GCL': continue
+            if not detail.get('path'): continue
+            try: checked_product(product)
+            except DmmError: continue
+            result[product]={'root':str(detail['path']),'version':str(detail.get('version','未知')),
+                             'title':str(detail.get('title') or product)}
+    except Exception:
+        return {}
+    return result
 
 
 def store_detail_url(product):
@@ -165,7 +195,15 @@ class GameService:
             data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
         except DmmApiError as error:
             if error.code==314:
-                raise StorePageNeeded(store_detail_url(self.product)) from None
+                # DMM 要求游戏先加入账号游戏库。最可靠的路径是官方 Player：
+                # 协议链接会打开官方 Player 并完成加库/安装；装好后本客户端可接管更新与启动。
+                try:
+                    os.startfile(f'dmmgameplayer://play/GCL/{self.product}/cl/win')
+                except OSError:
+                    pass
+                raise DmmError('DMM 要求先将该游戏加入游戏库：已为你打开官方 Player，'
+                               '在官方 Player 里启动/安装该游戏一次（首次可能需年龄认证），'
+                               '完成后回到本客户端点「检查更新」即可接管它的更新与启动') from None
             raise
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
@@ -202,7 +240,7 @@ class GameService:
             lambda:self.stopped(plan.root),self.session.cancel_check,self.download)
 
     def execute(self, action, install_root=None):
-        saved=records().get(self.product)
+        saved=records().get(self.product) or official_record(self.product)
         installing=not saved or action=='install'
         if installing:
             if install_root is None and action in {'check','install'}:

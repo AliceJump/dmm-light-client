@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
     QProgressBar, QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
-from .backend.games import (SUPPORTED, GameService, StorePageNeeded, catalog, cover_path,
-    records, refresh_catalog, save_cover, store_detail_url)
+from .backend.games import (SUPPORTED, GameService, catalog, cover_path, installed_record,
+    official_records, records, refresh_catalog, save_cover, store_detail_url)
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
@@ -83,7 +83,6 @@ class Worker(QThread):
     download = Signal(int, str)
     finished_ok = Signal(str)
     failed = Signal(str)
-    open_store = Signal(str)
 
     def __init__(self, action, settings, number='', name='', node_text='', product='', parent=None):
         super().__init__(parent)
@@ -192,14 +191,10 @@ class Worker(QThread):
             return '游戏进程已启动；请确认游戏内登录完成'
         if self.action in {'game-check', 'game-update', 'game-launch'}:
             action = self.action.removeprefix('game-')
-            if action == 'update' and self.product not in records():
+            if action == 'update' and not installed_record(self.product):
                 action = 'install'  # 未安装过的游戏直接全新安装
             service = GameService(helper.session, self.product, self.message.emit, self.progress)
-            try:
-                return service.execute(action)
-            except StorePageNeeded as error:
-                self.open_store.emit(error.url)  # 在应用内商店页完成加库（登录一次后持久）
-                raise DmmError(str(error)) from None
+            return service.execute(action)
         raise DmmError('未知操作')
 
 
@@ -235,7 +230,6 @@ class Window(QMainWindow):
         self.settings = load_settings()
         self.worker = None
         self.cover_worker = None
-        self.store_proxy_url = None
         self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
         self.library_buttons = []  # 车库卡片按钮（随网格重建）
         self.store_buttons = []    # 商店卡片按钮（随网格重建）
@@ -371,12 +365,13 @@ class Window(QMainWindow):
         titles = {'gakumas': '学园偶像大师'}
         titles.update(dict(SUPPORTED))
         titles.update({item['product']: item['title'] for item in catalog()})
+        titles.update({product: value.get('title', product) for product, value in official_records().items()})
         titles.update({product: value.get('title', product) for product, value in records().items()})
         return titles
 
     def repopulate_library(self):
         self.library_grid.clear(); self.library_buttons = []; self.library_covers = {}
-        installed = records()
+        installed = {**official_records(), **records()}
         try:
             _, version = DmmHelper.installed_game()
             state = f'已安装 · 版本 {version}'
@@ -388,15 +383,17 @@ class Window(QMainWindow):
             extra=[('选择游戏目录', 'game-folder', False)]))
         titles = self.known_titles()
         for product, value in sorted(installed.items()):
+            if product == 'gakumas': continue  # 学园偶像大师固定为第一张卡片
             title = titles.get(product, product)
+            origin = '官方 Player 安装 · ' if product not in records() else ''
             self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
                 self.library_covers, product, title,
-                f"已安装 · 版本 {value.get('version', '未知')}",
+                f"{origin}已安装 · 版本 {value.get('version', '未知')}",
                 [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False)]))
 
     def repopulate_store(self):
         self.store_grid.clear(); self.store_buttons = []; self.store_covers = {}
-        installed = records()
+        installed = {**official_records(), **records()}
         titles = self.known_titles()
         adult = {item['product'] for item in catalog() if item.get('adult')}
         query = self.search.text().strip().casefold()
@@ -465,13 +462,7 @@ class Window(QMainWindow):
     # ---------- 原生详情页 ----------
 
     def open_game_detail(self, product):
-        installed = records().get(product)
-        if installed is None and product == 'gakumas':
-            try:
-                _, version = DmmHelper.installed_game()
-                installed = {'version': version, 'root': ''}
-            except DmmError:
-                installed = None
+        installed = installed_record(product)
         entry = next((item for item in catalog() if item['product'] == product), {})
         title = self.known_titles().get(product, product)
         dialog = QDialog(self); dialog.setWindowTitle(title)
@@ -510,76 +501,6 @@ class Window(QMainWindow):
 
     # ---------- 应用内商店页 ----------
 
-    def ensure_store_proxy(self):
-        """ProxyHub 常驻代理：with 退出不再杀进程，端口跨操作稳定（Chromium 代理只设置一次）。"""
-        if self.store_proxy_url is not None: return self.store_proxy_url
-        with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
-            self.store_proxy_url = proxy
-        return self.store_proxy_url
-
-    def open_store_page(self, url):
-        # 顺序很重要：先起代理并写 Chromium 启动参数，再导入 QtWebEngine（导入时初始化 Chromium）
-        try:
-            proxy = self.ensure_store_proxy()
-        except DmmError as error:
-            self.report(f'商店页代理启动失败：{error}'); return
-        flags = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
-        if 'proxy-server' not in flags:
-            os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (flags + f' --proxy-server={proxy}').strip()
-        try:
-            from PySide6.QtWebEngineWidgets import QWebEngineView
-            from PySide6.QtWebEngineCore import QWebEngineProfile
-        except ImportError:
-            self.report('缺少 QtWebEngine 组件，改用系统浏览器打开')
-            os.startfile(url); return
-        # cookie 持久化：即使会话型 cookie 也写入磁盘，登录一次后自动保持登录
-        profile = QWebEngineProfile.defaultProfile()
-        profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
-        dialog = QDialog(self); dialog.setWindowTitle('DMM 商店页 · 应用内浏览（走软件代理）')
-        dialog.resize(1080, 760); dialog.setAttribute(Qt.WA_DeleteOnClose)
-        box = QVBoxLayout(dialog); bar = QHBoxLayout(); bar.setSpacing(8)
-        back = QPushButton('← 返回'); bar.addWidget(back)
-        reload_button = QPushButton('刷新'); bar.addWidget(reload_button)
-        login = QPushButton('登录 DMM'); bar.addWidget(login)
-        bar.addStretch()
-        close = QPushButton('关闭'); bar.addWidget(close)
-        box.addLayout(bar)
-        view = QWebEngineView(dialog); box.addWidget(view, 1)
-        back.clicked.connect(view.back); reload_button.clicked.connect(view.reload)
-        # 应用内走 DMM 官方登录：网页 cookie 留在内嵌浏览器（商店页此后自动登录），
-        # 授权码同时换发 API token——一次登录，商店与下载两边都通。
-        login.clicked.connect(lambda: self.start_store_login(view))
-        close.clicked.connect(dialog.close)
-        dialog.show()
-        self._current_store_url = url
-        view.load(QUrl(url))
-        self.report('已打开应用内商店页；首次使用请点「登录 DMM」，登录一次后自动保持')
-
-    def start_store_login(self, view):
-        """在应用内浏览器里走 DMM 官方登录：网页 cookie 留在内嵌浏览器（商店页此后自动
-        保持登录），登录成功的授权码同时换发 API token（下载与启动同步可用）。"""
-        try:
-            proxy = self.ensure_store_proxy()
-            session = DmmSession(proxy)
-            data = session.request('/v5/auth/login/url', {'prompt': ''})
-            login_url = dmm_url(data['url'])
-        except DmmError as error:
-            self.report(f'获取登录页失败：{error}'); return
-        state = {'done': False}
-        def on_url_changed(qurl):
-            code = DmmSession._code(qurl.toString())
-            if not code or state['done']: return
-            state['done'] = True
-            try:
-                session._exchange(code)
-                self.report('DMM 登录成功：商店页与游戏下载均已验证')
-                view.load(QUrl(self._current_store_url or 'https://app-gameplayer.dmm.com/'))
-            except DmmError as error:
-                self.report(f'登录交换失败：{error}')
-        view.urlChanged.connect(on_url_changed)
-        view.load(QUrl(login_url))
-        self.report('请在页面内完成 DMM 登录；登录一次，商店页与下载都会记住')
-
     def showEvent(self, event):
         super().showEvent(event)
         self.kick_covers()
@@ -599,7 +520,7 @@ class Window(QMainWindow):
             self.report('已有操作正在进行，请等它结束或点「暂停当前操作」'); return
         try:
             if action == 'store-open':
-                self.open_store_page(store_detail_url(product)); return
+                self.open_store_externally(store_detail_url(product)); return
             if action == 'detail-open':
                 self.open_game_detail(product); return
             if action == 'game-folder':
@@ -627,7 +548,6 @@ class Window(QMainWindow):
             self.worker.message.connect(self.report)
             self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
             self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
-            self.worker.open_store.connect(self.open_store_page)
             self.worker.finished.connect(self.operation_finished)
             self.pause.setEnabled(True); self.bar.setRange(0,0)
             self.status.setText('正在处理…'); self.worker.start()
