@@ -59,10 +59,13 @@ def refresh_catalog(session):
                     if not isinstance(title,str) or not title: raise DmmError('游戏名称无效')
                     image=item.get('image_url')
                     genre=item.get('genre'); maker=item.get('maker')
+                    link=item.get('link') or {}
+                    link_url=link.get('url') if isinstance(link,dict) else None
                     result[product]={'product':product,'title':title[:240],'adult':adult,
                                      'image_url':image if isinstance(image,str) and image.startswith('http') else '',
                                      'genre':genre[:40] if isinstance(genre,str) else '',
-                                     'maker':maker[:60] if isinstance(maker,str) else ''}
+                                     'maker':maker[:60] if isinstance(maker,str) else '',
+                                     'link':link_url[:200] if isinstance(link_url,str) and link_url.startswith('/') else ''}
                 if page*120>=total: break
                 if not items or page>=100: raise DmmError('游戏列表分页不完整')
                 page+=1
@@ -85,6 +88,22 @@ def catalog_image_url(product):
             if item['product'] == product: return item.get('image_url') or None
     except (DmmError, ValueError): pass
     return None
+
+
+def store_detail_url(product):
+    """官方 Player 内嵌商店的详情页地址：origin + 目录接口给的 link 路径。
+
+    公开网页 games.dmm.com/detail/{product} 对多数目录游戏并不存在（404），
+    真正的详情页在 app-gameplayer.dmm.com（官方 Player 内嵌商店同源）。
+    """
+    try:
+        for item in catalog():
+            if item['product'] == product:
+                link = item.get('link')
+                if isinstance(link, str) and link.startswith('/'):
+                    return 'https://app-gameplayer.dmm.com' + link
+    except (DmmError, ValueError): pass
+    return f'https://games.dmm.com/detail/{product}'
 
 
 def save_cover(http, product, root, progress=lambda message: None):
@@ -146,7 +165,7 @@ class GameService:
             data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
         except DmmApiError as error:
             if error.code==314:
-                raise StorePageNeeded(f'https://games.dmm.com/detail/{self.product}') from None
+                raise StorePageNeeded(store_detail_url(self.product)) from None
             raise
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')

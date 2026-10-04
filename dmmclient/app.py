@@ -22,7 +22,7 @@ from shiboken6 import Shiboken
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, StorePageNeeded, catalog, cover_path,
-    records, refresh_catalog, save_cover)
+    records, refresh_catalog, save_cover, store_detail_url)
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
@@ -596,7 +596,7 @@ class Window(QMainWindow):
             self.report('已有操作正在进行，请等它结束或点「暂停当前操作」'); return
         try:
             if action == 'store-open':
-                self.open_store_page(f'https://games.dmm.com/detail/{product}'); return
+                self.open_store_page(store_detail_url(product)); return
             if action == 'detail-open':
                 self.open_game_detail(product); return
             if action == 'game-folder':
