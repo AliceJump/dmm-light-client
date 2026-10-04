@@ -25,8 +25,7 @@ from .backend.games import (SUPPORTED, GameService, StorePageNeeded, catalog, co
     records, refresh_catalog, save_cover, store_detail_url)
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
-from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
-    atomic_write, data_dir, valid_proxy)
+from .backend.session import DmmError, LoginRequired, OperationCancelled, atomic_write, data_dir, valid_proxy
 from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
 
 
@@ -519,25 +518,6 @@ class Window(QMainWindow):
             self.store_proxy_url = proxy
         return self.store_proxy_url
 
-    def _inject_session_cookies(self, cookie_store):
-        """把加密保存的 DMM 登录态注入内嵌浏览器，页面内可直接点「ゲーム開始」。"""
-        from PySide6.QtCore import QDateTime
-        from PySide6.QtNetwork import QNetworkCookie
-        try:
-            session = DmmSession(self.store_proxy_url)
-        except Exception:
-            return  # 登录态不可用时，用户也可以直接在内嵌页面里登录 DMM
-        for c in session.http.cookies:
-            if c.expires and c.expires <= time.time(): continue
-            try:
-                cookie = QNetworkCookie(c.name.encode(), c.value.encode())
-                cookie.setDomain(c.domain); cookie.setPath(c.path or '/')
-                if c.secure: cookie.setSecure(True)
-                if c.expires: cookie.setExpirationDate(QDateTime.fromSecsSinceEpoch(c.expires))
-                cookie_store.setCookie(cookie)
-            except Exception:
-                continue  # 单条 cookie 失败不影响页面加载
-
     def open_store_page(self, url):
         # 顺序很重要：先起代理并写 Chromium 启动参数，再导入 QtWebEngine（它在导入时初始化 Chromium）
         try:
@@ -559,16 +539,20 @@ class Window(QMainWindow):
         box = QVBoxLayout(dialog); bar = QHBoxLayout(); bar.setSpacing(8)
         back = QPushButton('← 返回'); bar.addWidget(back)
         reload_button = QPushButton('刷新'); bar.addWidget(reload_button)
+        login = QPushButton('登录 DMM'); bar.addWidget(login)
         bar.addStretch()
         close = QPushButton('关闭'); bar.addWidget(close)
         box.addLayout(bar)
         view = QWebEngineView(dialog); box.addWidget(view, 1)
-        self._inject_session_cookies(view.page().profile().cookieStore())
         back.clicked.connect(view.back); reload_button.clicked.connect(view.reload)
+        # 网页商店需要 DMM 网页登录态（与 API token 是两套体系）；
+        # 在应用内登录一次，cookie 由 QtWebEngine 持久保存，之后商店页可用。
+        login.clicked.connect(lambda: view.load(QUrl(
+            'https://accounts.dmm.com/service/login/password/=/path=https%3A%2F%2Fapp-gameplayer.dmm.com%2F')))
         close.clicked.connect(dialog.close)
         dialog.show()
         view.load(QUrl(url))
-        self.report('已打开应用内商店页（走软件代理）')
+        self.report('已打开应用内商店页；若提示拒绝访问，请点「登录 DMM」登录一次')
 
     def showEvent(self, event):
         super().showEvent(event)
