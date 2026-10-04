@@ -121,19 +121,11 @@ def official_records():
 
 
 def store_detail_url(product):
-    """官方 Player 内嵌商店的详情页地址：origin + 目录接口给的 link 路径。
+    """游戏商店详情页：DMM GAMES 已迁移到 games.dmm.co.jp（旧 .com 域名子路径 404）。
 
-    公开网页 games.dmm.com/detail/{product} 对多数目录游戏并不存在（404），
-    真正的详情页在 app-gameplayer.dmm.com（官方 Player 内嵌商店同源）。
+    系统浏览器里用户已登录 DMM，可直接在该页点「ゲーム開始」加库。
     """
-    try:
-        for item in catalog():
-            if item['product'] == product:
-                link = item.get('link')
-                if isinstance(link, str) and link.startswith('/'):
-                    return 'https://app-gameplayer.dmm.com' + link
-    except (DmmError, ValueError): pass
-    return f'https://games.dmm.com/detail/{product}'
+    return f'https://games.dmm.co.jp/detail/{product}'
 
 
 def save_cover(http, product, root, progress=lambda message: None):
@@ -195,15 +187,14 @@ class GameService:
             data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
         except DmmApiError as error:
             if error.code==314:
-                # DMM 要求游戏先加入账号游戏库。最可靠的路径是官方 Player：
-                # 协议链接会打开官方 Player 并完成加库/安装；装好后本客户端可接管更新与启动。
+                # DMM 要求游戏先加入账号游戏库：系统浏览器已登录 DMM，
+                # 打开该游戏的商店详情页点「ゲーム開始」即可加库。
                 try:
-                    os.startfile(f'dmmgameplayer://play/GCL/{self.product}/cl/win')
+                    os.startfile(store_detail_url(self.product))
                 except OSError:
                     pass
-                raise DmmError('DMM 要求先将该游戏加入游戏库：已为你打开官方 Player，'
-                               '在官方 Player 里启动/安装该游戏一次（首次可能需年龄认证），'
-                               '完成后回到本客户端点「检查更新」即可接管它的更新与启动') from None
+                raise DmmError('DMM 要求先将该游戏加入游戏库：已在浏览器打开该游戏的商店页，'
+                               '请点击「ゲーム開始」（首次可能需年龄认证），完成后重新点「全新安装」') from None
             raise
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
