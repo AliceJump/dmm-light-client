@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import faulthandler
+import ctypes
 import json
 import os
 import sys
 import threading
 import time
 import traceback
+import winreg
 from pathlib import Path
 
 import requests
@@ -20,7 +22,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, StorePageNeeded, catalog, cover_path,
-    installed_record, official_records, records, refresh_catalog, save_cover, store_detail_url)
+    installed_record, official_records, records, refresh_catalog, save_cover)
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
@@ -76,6 +78,51 @@ def log_error(text):
         with (data_dir() / 'client.log').open('a', encoding='utf-8', errors='replace') as stream:
             stream.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {text}\n')
     except OSError: pass
+
+
+_PROXY_KEY_PATH = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+_PROXY_BACKUP = {}
+_PROXY_LOCK = threading.Lock()
+
+
+def _read_system_proxy():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PROXY_KEY_PATH, 0, winreg.KEY_READ) as key:
+            def get(name, default):
+                try: return winreg.QueryValueEx(key, name)[0]
+                except OSError: return default
+            return {'enable': get('ProxyEnable', 0), 'server': get('ProxyServer', '')}
+    except OSError:
+        return {'enable': 0, 'server': ''}
+
+
+def _apply_system_proxy(enable, server=''):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PROXY_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 1 if enable else 0)
+        if enable and server:
+            winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, server)
+    wininet = ctypes.WinDLL('wininet')
+    wininet.InternetSetOptionW(None, 39, None, 0)   # INTERNET_OPTION_SETTINGS_CHANGED
+    wininet.InternetSetOptionW(None, 37, None, 0)   # INTERNET_OPTION_REFRESH
+
+
+def enable_system_proxy(server):
+    """临时开启 Windows 系统代理指向本客户端的常驻节点（备份原设置，可还原）。"""
+    with _PROXY_LOCK:
+        if 'enable' not in _PROXY_BACKUP:
+            _PROXY_BACKUP.update(_read_system_proxy())
+        _apply_system_proxy(True, server)
+
+
+def restore_system_proxy():
+    with _PROXY_LOCK:
+        if _PROXY_BACKUP:
+            _apply_system_proxy(bool(_PROXY_BACKUP.get('enable')), _PROXY_BACKUP.get('server', ''))
+            _PROXY_BACKUP.clear()
+
+
+def system_proxy_active():
+    return bool(_PROXY_BACKUP)
 
 
 class Worker(QThread):
@@ -325,6 +372,10 @@ class Window(QMainWindow):
         hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
         row = QHBoxLayout(); row.setSpacing(10); n.addLayout(row)
         self.button(row, '保存代理设置', 'settings'); self.button(row, '测试 DMM 连接', 'test')
+        self.sysproxy = QPushButton('开启系统代理（给本机浏览器临时用）'); self.sysproxy.setCheckable(True)
+        self.sysproxy.toggled.connect(self.toggle_system_proxy); n.addWidget(self.sysproxy)
+        hint = QLabel('开启后本机浏览器经本客户端节点访问 DMM（用于商店加库）；关闭软件或再点一次即还原。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
         self.nodes = QComboBox(); n.addWidget(self.nodes)
         self.node_text = QLineEdit(); self.node_text.setEchoMode(QLineEdit.EchoMode.Password)
         self.node_text.setPlaceholderText('粘贴节点分享链接或单节点 Xray JSON，内容隐藏'); n.addWidget(self.node_text)
@@ -439,6 +490,9 @@ class Window(QMainWindow):
             self.status.setText(str(error))
         except Exception:
             self.report('界面数据加载失败，详情见 client.log'); raise
+        try:
+            self.sysproxy.blockSignals(True); self.sysproxy.setChecked(system_proxy_active()); self.sysproxy.blockSignals(False)
+        except Exception: pass
         self.kick_covers()
 
     def paint_cover(self, label, product):
@@ -497,7 +551,7 @@ class Window(QMainWindow):
         buttons = QHBoxLayout(); buttons.setSpacing(8); column.addLayout(buttons)
         spec = ([('启动', 'game-launch', True), ('更新', 'game-update', False)] if installed
                 else [('全新安装', 'game-update', True)])
-        for text, action, accent in spec + [('检查', 'game-check', False), ('网页商店', 'store-open', False)]:
+        for text, action, accent in spec + [('检查', 'game-check', False)]:
             button = QPushButton(text); button.setObjectName('mini')
             if accent: button.setProperty('accent', True)
             button.clicked.connect(lambda _, a=action, p=product: self.run_action(a, p))
@@ -601,12 +655,22 @@ class Window(QMainWindow):
     def cancel(self):
         if self.worker: self.worker.cancelled.set(); self.status.setText('正在暂停并保存下载断点…')
 
+    def toggle_system_proxy(self, checked):
+        if checked:
+            try:
+                with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
+                    enable_system_proxy(str(proxy).replace('http://', ''))
+                self.report('系统代理已开启：本机浏览器现在可访问 DMM 商店；关闭软件或再点一次即还原')
+            except DmmError as error:
+                self.sysproxy.setChecked(False)
+                self.report(f'系统代理开启失败：{error}')
+        else:
+            restore_system_proxy(); self.report('系统代理已恢复原设置')
+
     def run_action(self, action, product=''):
         if self.worker and self.worker.isRunning():
             self.report('已有操作正在进行，请等它结束或点「暂停当前操作」'); return
         try:
-            if action == 'store-open':
-                self.open_store_page(store_detail_url(product)); return
             if action == 'detail-open':
                 self.open_game_detail(product); return
             if action == 'game-folder':
@@ -659,6 +723,7 @@ class Window(QMainWindow):
             self.cancel(); self.status.setText('请等待当前操作停止后再关闭客户端'); event.ignore()
         else:
             if self.cover_worker and self.cover_worker.isRunning(): self.cover_worker.wait(3000)
+            restore_system_proxy()
             HUB.shutdown()
             event.accept()
 
