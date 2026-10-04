@@ -40,10 +40,16 @@ def catalog():
     return json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
 
 
+def set_age_cookie(session, verified):
+    """age_check_done=1 表示已完成年龄认证；Fanza 目录与 ACL 游戏的全部调用都要求它。"""
+    session.http.cookies.set('age_check_done', '1' if verified else '0', domain='.dmm.com', path='/')
+
+
 def refresh_catalog(session):
     session.ensure_login()
     result={}
     for adult in (False, True):
+        set_age_cookie(session, adult)
         try:
             page=1
             while True:
@@ -73,6 +79,7 @@ def refresh_catalog(session):
         except DmmError as error:
             if not adult: raise
             session.progress('Fanza 游戏列表获取失败，已跳过：'+str(error))
+    set_age_cookie(session, False)
     value=list(result.values())
     atomic_write(data_dir()/'catalog.json',json.dumps(value,ensure_ascii=False).encode())
     return value
@@ -185,50 +192,80 @@ class GameService:
         if product not in known: raise DmmError('请先刷新官方游戏列表并选择游戏')
         self.title=known[product]
         self.session, self.product, self.progress, self.download = session, product, progress, download
+        # Fanza（R18）游戏走 co.jp 域名、game_type=ACL；一般游戏走 .com、GCL。以目录 link 字段为准。
+        entry = next((item for item in catalog() if item['product'] == product), None)
+        link = (entry or {}).get('link') or ''
+        self.adult = bool((entry or {}).get('adult')) or '.co.jp' in link
+        self.domain = 'app-gameplayer.dmm.co.jp' if '.co.jp' in link else 'app-gameplayer.dmm.com'
 
     def request_info(self, installing=False):
         self.session.ensure_login()
-        kind=self.session.request('/v5/gametype',{'product_id':self.product,'domain':'app-gameplayer.dmm.com','floor_type':'free',**self.session.device})
-        if kind.get('game_type')!='GCL': raise DmmError('该游戏不是受支持的普通 PC 下载型游戏')
-        payload={'product_id':self.product,'game_type':'GCL','game_os':'win',**self.session.device}
-        if not installing: payload['launch_type']='LIB'
+        if self.adult: set_age_cookie(self.session, True)
         try:
-            data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
-        except DmmApiError as error:
-            if error.code==314:
-                # 314 = 游戏不在账号的 DMM 游戏库。官方抓包确认加库接口：
-                # POST /v5/detail/mygame/add {"product_id","game_type","game_os"}（需 5.5.21 UA + age_check_done cookie）
-                # 自动加库后重试原请求，无需用户去商店页操作。
-                self.progress('该游戏未加入 DMM 游戏库，正在自动加入…')
-                added=self.session.request('/v5/detail/mygame/add',
-                    {'product_id':self.product,'game_type':'GCL','game_os':'win'})
-                if not (isinstance(added,dict) and added.get('result')):
-                    raise DmmError('自动加入 DMM 游戏库失败，请稍后重试') from None
-                self.progress('已加入游戏库，继续获取安装信息')
-                try:
-                    data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
-                except DmmApiError as retry_error:
-                    if retry_error.code==308:
-                        # 308 = 该游戏从未经过官方下载系统，首次下载被 DMM 服务端拒绝
-                        # （实测：官方装过的游戏任意设备都 100，新加库的游戏任何头/设备都 308）。
-                        # 唯一通路是官方下载器：协议链接唤起官方 Player 完成首次安装，
-                        # 装完后（dmmgame.cnf 出现记录）本客户端自动接管更新与启动。
-                        try:
-                            os.startfile(f'dmmgameplayer://play/GCL/{self.product}/cl/win')
-                        except OSError:
-                            pass
-                        raise DmmError('该游戏首次下载必须由官方下载器执行（DMM 服务端限制）：'
-                                       '已为你打开官方 Player，请在那里点击下载（装一半取消也行），'
-                                       '完成后回到本客户端即可接管更新与启动') from None
+            game_type = self._detect_game_type()
+            payload={'product_id':self.product,'game_type':game_type,'game_os':'win',**self.session.device}
+            if not installing: payload['launch_type']='LIB'
+            endpoint='/v5/r2/install/cl' if installing else '/v5/r2/launch/cl'
+            try:
+                data=self.session.request(endpoint,payload)
+            except DmmApiError as error:
+                if error.code==314:
+                    # 314 = 游戏不在账号的 DMM 游戏库。官方抓包确认加库接口：
+                    # POST /v5/detail/mygame/add {"product_id","game_type","game_os"}
+                    # 自动加库后重试原请求，无需用户去商店页操作。
+                    self.progress('该游戏未加入 DMM 游戏库，正在自动加入…')
+                    added=self.session.request('/v5/detail/mygame/add',
+                        {'product_id':self.product,'game_type':game_type,'game_os':'win'})
+                    if not (isinstance(added,dict) and added.get('result')):
+                        raise DmmError('自动加入 DMM 游戏库失败，请稍后重试') from None
+                    self.progress('已加入游戏库，继续获取安装信息')
+                    try:
+                        data=self.session.request(endpoint,payload)
+                    except DmmApiError as retry_error:
+                        if retry_error.code==308: self._first_download_fallback(game_type)
+                        raise
+                elif error.code==308:
+                    self._first_download_fallback(game_type)
+                else:
                     raise
-            else:
-                raise
+        finally:
+            if self.adult: set_age_cookie(self.session, False)
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
         if data.get('has_modules'): raise DmmError('该游戏需要额外运行模块，暂不支持自动安装')
         if data.get('drm_auth_token'): raise DmmError('该游戏需要额外 DRM 授权，暂不支持启动')
         if not data.get('file_list_url') or not data.get('sign'): raise DmmError('服务器未提供可用的标准下载清单')
         return data
+
+    def _first_download_fallback(self, game_type):
+        """308 = 该游戏从未经过官方下载系统，首次下载被 DMM 服务端拒绝
+        （实测：官方装过的游戏任意设备都 100，新加库的游戏任何头/设备都 308，与 GCL/ACL 无关）。
+        唯一通路是官方下载器：协议链接唤起官方 Player 完成首次安装，
+        装完后（dmmgame.cnf 出现记录）本客户端自动接管更新与启动。"""
+        try:
+            os.startfile(f'dmmgameplayer://play/{game_type}/{self.product}/cl/win')
+        except OSError:
+            pass
+        raise DmmError('该游戏首次下载必须由官方下载器执行（DMM 服务端限制）：'
+                       '已为你打开官方 Player，请在那里点击下载（装一半取消也行），'
+                       '完成后回到本客户端即可接管更新与启动') from None
+
+    def _detect_game_type(self):
+        """gametype 探测：Fanza 游戏返回 ACL（co.jp 域名），一般游戏 GCL（.com）。"""
+        domains = (self.domain, 'app-gameplayer.dmm.co.jp' if self.domain == 'app-gameplayer.dmm.com'
+                   else 'app-gameplayer.dmm.com')
+        last_error = None
+        for domain in domains:
+            try:
+                kind = self.session.request('/v5/gametype', {
+                    'product_id': self.product, 'domain': domain, 'floor_type': 'free', **self.session.device})
+            except DmmApiError as error:
+                last_error = error
+                continue
+            game_type = kind.get('game_type')
+            if game_type in ('GCL', 'ACL'): return game_type
+        if last_error is not None: raise last_error
+        raise DmmError('无法识别该游戏类型（GCL/ACL 均不匹配）')
 
     def plan(self, info, root):
         url=info['file_list_url']
