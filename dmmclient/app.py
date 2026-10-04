@@ -23,7 +23,8 @@ from .backend.games import (SUPPORTED, GameService, StorePageNeeded, catalog, co
     records, refresh_catalog, save_cover, store_detail_url)
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
-from .backend.session import DmmError, LoginRequired, OperationCancelled, atomic_write, data_dir, valid_proxy
+from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
+    atomic_write, data_dir, dmm_url, valid_proxy)
 from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
 
 
@@ -545,12 +546,39 @@ class Window(QMainWindow):
         box.addLayout(bar)
         view = QWebEngineView(dialog); box.addWidget(view, 1)
         back.clicked.connect(view.back); reload_button.clicked.connect(view.reload)
-        login.clicked.connect(lambda: view.load(QUrl(
-            'https://accounts.dmm.com/service/login/password/=/path=https%3A%2F%2Fapp-gameplayer.dmm.com%2F')))
+        # 应用内走 DMM 官方登录：网页 cookie 留在内嵌浏览器（商店页此后自动登录），
+        # 授权码同时换发 API token——一次登录，商店与下载两边都通。
+        login.clicked.connect(lambda: self.start_store_login(view))
         close.clicked.connect(dialog.close)
         dialog.show()
+        self._current_store_url = url
         view.load(QUrl(url))
-        self.report('已打开应用内商店页；首次使用请点「登录 DMM」登录一次，之后自动保持登录')
+        self.report('已打开应用内商店页；首次使用请点「登录 DMM」，登录一次后自动保持')
+
+    def start_store_login(self, view):
+        """在应用内浏览器里走 DMM 官方登录：网页 cookie 留在内嵌浏览器（商店页此后自动
+        保持登录），登录成功的授权码同时换发 API token（下载与启动同步可用）。"""
+        try:
+            proxy = self.ensure_store_proxy()
+            session = DmmSession(proxy)
+            data = session.request('/v5/auth/login/url', {'prompt': ''})
+            login_url = dmm_url(data['url'])
+        except DmmError as error:
+            self.report(f'获取登录页失败：{error}'); return
+        state = {'done': False}
+        def on_url_changed(qurl):
+            code = DmmSession._code(qurl.toString())
+            if not code or state['done']: return
+            state['done'] = True
+            try:
+                session._exchange(code)
+                self.report('DMM 登录成功：商店页与游戏下载均已验证')
+                view.load(QUrl(self._current_store_url or 'https://app-gameplayer.dmm.com/'))
+            except DmmError as error:
+                self.report(f'登录交换失败：{error}')
+        view.urlChanged.connect(on_url_changed)
+        view.load(QUrl(login_url))
+        self.report('请在页面内完成 DMM 登录；登录一次，商店页与下载都会记住')
 
     def showEvent(self, event):
         super().showEvent(event)
