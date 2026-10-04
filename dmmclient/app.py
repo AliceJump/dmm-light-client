@@ -578,9 +578,14 @@ class Window(QMainWindow):
                 view.load(QUrl(self._current_store_url or 'https://games.dmm.co.jp/'))
             except DmmError as error:
                 self.report(f'登录交换失败：{error}')
+        if getattr(self, '_store_login_handler', None) is not None:
+            try: view.urlChanged.disconnect(self._store_login_handler)
+            except (RuntimeError, TypeError): pass
+        self._store_login_handler = on_url_changed
         view.urlChanged.connect(on_url_changed)
         view.load(QUrl(login_url))
         self.report('请在页面内完成 DMM 登录；登录一次，商店页与下载都会记住')
+
 
     def showEvent(self, event):
         super().showEvent(event)
