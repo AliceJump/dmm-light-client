@@ -4,7 +4,9 @@ import base64
 import json
 import os
 import secrets
+import shutil
 import sqlite3
+import tempfile
 import time
 from http.cookiejar import Cookie
 from pathlib import Path

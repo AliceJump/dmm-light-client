@@ -17,8 +17,6 @@ from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QPainter, QPai
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QProgressBar, QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
-from shiboken6 import Shiboken
-
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, StorePageNeeded, catalog, cover_path,
@@ -84,7 +82,6 @@ class Worker(QThread):
     download = Signal(int, str)
     finished_ok = Signal(str)
     failed = Signal(str)
-    open_store = Signal(str)
 
     def __init__(self, action, settings, number='', name='', node_text='', product='', parent=None):
         super().__init__(parent)
@@ -199,7 +196,10 @@ class Worker(QThread):
             try:
                 return service.execute(action)
             except StorePageNeeded as error:
-                self.open_store.emit(error.url)
+                # 314：游戏未加入 DMM 游戏库。用系统浏览器打开详情页——用户已在系统浏览器登录 DMM，
+                # 直接点「ゲーム開始」即可，无需应用内登录。
+                try: os.startfile(error.url)
+                except OSError: pass
                 raise DmmError(str(error)) from None
         raise DmmError('未知操作')
 
@@ -236,7 +236,6 @@ class Window(QMainWindow):
         self.settings = load_settings()
         self.worker = None
         self.cover_worker = None
-        self.store_proxy_url = None
         self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
         self.library_buttons = []  # 车库卡片按钮（随网格重建）
         self.store_buttons = []    # 商店卡片按钮（随网格重建）
@@ -511,48 +510,12 @@ class Window(QMainWindow):
 
     # ---------- 应用内商店页 ----------
 
-    def ensure_store_proxy(self):
-        """ProxyHub 常驻代理：with 退出不再杀进程，端口跨操作稳定。"""
-        if self.store_proxy_url is not None: return self.store_proxy_url
-        with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
-            self.store_proxy_url = proxy
-        return self.store_proxy_url
-
-    def open_store_page(self, url):
-        # 顺序很重要：先起代理并写 Chromium 启动参数，再导入 QtWebEngine（它在导入时初始化 Chromium）
+    def open_store_externally(self, url):
+        """用系统浏览器打开商店页：用户已在系统浏览器登录 DMM，零额外步骤。"""
         try:
-            proxy = self.ensure_store_proxy()
-        except DmmError as error:
-            self.report(f'商店页代理启动失败：{error}'); return
-        flags = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
-        if 'proxy-server' not in flags:
-            os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (flags + f' --proxy-server={proxy}').strip()
-        try:
-            from PySide6.QtWebEngineWidgets import QWebEngineView
-        except ImportError:
-            self.report('缺少 QtWebEngine 组件，改用系统浏览器打开')
-            os.startfile(url); return
-        from PySide6.QtCore import QUrl
-        from PySide6.QtWidgets import QDialog
-        dialog = QDialog(self); dialog.setWindowTitle('DMM 商店页 · 应用内浏览（走软件代理）')
-        dialog.resize(1080, 760); dialog.setAttribute(Qt.WA_DeleteOnClose)
-        box = QVBoxLayout(dialog); bar = QHBoxLayout(); bar.setSpacing(8)
-        back = QPushButton('← 返回'); bar.addWidget(back)
-        reload_button = QPushButton('刷新'); bar.addWidget(reload_button)
-        login = QPushButton('登录 DMM'); bar.addWidget(login)
-        bar.addStretch()
-        close = QPushButton('关闭'); bar.addWidget(close)
-        box.addLayout(bar)
-        view = QWebEngineView(dialog); box.addWidget(view, 1)
-        back.clicked.connect(view.back); reload_button.clicked.connect(view.reload)
-        # 网页商店需要 DMM 网页登录态（与 API token 是两套体系）；
-        # 在应用内登录一次，cookie 由 QtWebEngine 持久保存，之后商店页可用。
-        login.clicked.connect(lambda: view.load(QUrl(
-            'https://accounts.dmm.com/service/login/password/=/path=https%3A%2F%2Fapp-gameplayer.dmm.com%2F')))
-        close.clicked.connect(dialog.close)
-        dialog.show()
-        view.load(QUrl(url))
-        self.report('已打开应用内商店页；若提示拒绝访问，请点「登录 DMM」登录一次')
+            os.startfile(url)
+        except OSError:
+            self.report('无法打开系统浏览器，请手动访问：' + url)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -568,19 +531,12 @@ class Window(QMainWindow):
     def cancel(self):
         if self.worker: self.worker.cancelled.set(); self.status.setText('正在暂停并保存下载断点…')
 
-    def set_busy(self, busy):
-        controls = [self.mode, self.proxy, self.accounts, self.number, self.name,
-                    self.node_text, self.search, self.filter_box] + self.buttons \
-                   + self.library_buttons + self.store_buttons
-        for control in controls:
-            if Shiboken.isValid(control): control.setEnabled(not busy)
-
     def run_action(self, action, product=''):
         if self.worker and self.worker.isRunning():
             self.report('已有操作正在进行，请等它结束或点「暂停当前操作」'); return
         try:
             if action == 'store-open':
-                self.open_store_page(store_detail_url(product)); return
+                self.open_store_externally(store_detail_url(product)); return
             if action == 'detail-open':
                 self.open_game_detail(product); return
             if action == 'game-folder':
@@ -608,7 +564,6 @@ class Window(QMainWindow):
             self.worker.message.connect(self.report)
             self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
             self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
-            self.worker.open_store.connect(self.open_store_page)
             self.worker.finished.connect(self.operation_finished)
             self.pause.setEnabled(True); self.bar.setRange(0,0)
             self.status.setText('正在处理…'); self.worker.start()
