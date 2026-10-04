@@ -9,6 +9,7 @@ import json
 import re
 import socket
 import subprocess
+import threading
 import time
 import zipfile
 import uuid
@@ -230,6 +231,13 @@ class NodeStore:
                 self.write(saved)
                 return
 
+    def pin(self, node_id):
+        """记住最近可用的节点：下次连接（含重启软件后）优先使用它。"""
+        saved = self.read()
+        if saved.get('next') != node_id:
+            saved['next'] = node_id
+            self.write(saved)
+
     def install(self, bootstrap_proxy, progress=lambda message: None):
         if self.exe.is_file():
             return self.exe
@@ -404,7 +412,7 @@ class NodePool:
 
     def success(self):
         if not self.recorded:
-            self.store.advance(self.nodes[self.index]['id'])
+            self.store.pin(self.nodes[self.index]['id'])
             self.recorded = True
 
 
@@ -440,21 +448,69 @@ def attach_pool(http, proxy):
         http.proxy_attempts = len(pool.nodes) + 2
 
 
-@contextmanager
+class ProxyHub:
+    """常驻代理管理器：Xray 进程跨操作复用，最近可用节点粘性优先。
+
+    首次操作仍需扫描节点；之后只要进程存活、配置未变，后续操作立即返回
+    现成地址（无端口绑定、无节点扫描）。端口在进程生命周期内保持不变，
+    内嵌浏览器（Chromium 代理参数只能设置一次）因此可以稳定复用。
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._fingerprint = None
+        self._pool = None
+        self._address = None
+        self._port = None
+
+    @staticmethod
+    def _fingerprint_of(settings):
+        return json.dumps({key: settings.get(key) for key in (NODE_ENABLED_KEY, 'proxy')},
+                          ensure_ascii=False, sort_keys=True)
+
+    def _alive(self):
+        if self._pool is None or self._address is None: return False
+        parsed = urlsplit(str(self._address))
+        try:
+            with socket.create_connection((parsed.hostname, parsed.port), timeout=0.5):
+                return True
+        except OSError:
+            return False
+
+    @contextmanager
+    def acquire(self, settings, progress=lambda message: None, cancel_check=lambda: None, root=None):
+        if not settings.get(NODE_ENABLED_KEY, False):
+            yield valid_proxy(settings['proxy']); return
+        root = root or data_dir()
+        fingerprint = self._fingerprint_of(settings)
+        with self._lock:
+            if self._pool is None or fingerprint != self._fingerprint or not self._alive():
+                if self._pool is not None:
+                    self._pool.close(); self._pool = None
+                store = NodeStore(root)
+                exe = store.install(settings['proxy'], progress)
+                if self._port is None:
+                    with socket.socket() as inlet:
+                        inlet.bind(('127.0.0.1', 0))
+                        self._port = inlet.getsockname()[1]
+                pool = NodePool(store, exe, self._port, progress, cancel_check)
+                pool.failover()
+                self._pool = pool
+                self._address = ProxyAddress(f'http://127.0.0.1:{self._port}', pool)
+                self._fingerprint = fingerprint
+            else:
+                # 复用常驻进程：仅同步当前操作的进度与取消回调
+                self._pool.progress, self._pool.cancel_check = progress, cancel_check
+        yield self._address
+
+    def shutdown(self):
+        with self._lock:
+            if self._pool is not None: self._pool.close()
+            self._pool, self._address, self._fingerprint = None, None, None
+
+
+HUB = ProxyHub()
+
+
 def operation_proxy(settings, progress=lambda message: None, cancel_check=lambda: None, root=None):
-    DMM_PROXY_KEY = 'proxy'
-    root = root or data_dir()
-    if not settings.get(NODE_ENABLED_KEY, False):
-        yield valid_proxy(settings[DMM_PROXY_KEY])
-        return
-    store = NodeStore(root)
-    exe = store.install(settings[DMM_PROXY_KEY], progress)
-    with socket.socket() as inlet:
-        inlet.bind(('127.0.0.1', 0))
-        port = inlet.getsockname()[1]
-    pool = NodePool(store, exe, port, progress, cancel_check)
-    try:
-        pool.failover()
-        yield ProxyAddress(f'http://127.0.0.1:{port}', pool)
-    finally:
-        pool.close()
+    """兼容旧签名：现在通过常驻 ProxyHub 获取代理地址（返回上下文管理器）。"""
+    return HUB.acquire(settings, progress, cancel_check, root)

@@ -58,8 +58,11 @@ def refresh_catalog(session):
                     title=item.get('title')
                     if not isinstance(title,str) or not title: raise DmmError('游戏名称无效')
                     image=item.get('image_url')
+                    genre=item.get('genre'); maker=item.get('maker')
                     result[product]={'product':product,'title':title[:240],'adult':adult,
-                                     'image_url':image if isinstance(image,str) and image.startswith('http') else ''}
+                                     'image_url':image if isinstance(image,str) and image.startswith('http') else '',
+                                     'genre':genre[:40] if isinstance(genre,str) else '',
+                                     'maker':maker[:60] if isinstance(maker,str) else ''}
                 if page*120>=total: break
                 if not items or page>=100: raise DmmError('游戏列表分页不完整')
                 page+=1

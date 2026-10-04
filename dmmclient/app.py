@@ -14,9 +14,9 @@ import requests
 from PySide6.QtCore import QSize, Qt, QThread, Signal
 from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath,
     QPixmap)
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout, QFrame,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QProgressBar,
-    QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QProgressBar, QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 from shiboken6 import Shiboken
 
 from .backend.accounts import AccountStore
@@ -27,7 +27,7 @@ from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
     atomic_write, data_dir, valid_proxy)
-from .backend.xray import NODE_ENABLED_KEY, NodeStore, operation_proxy, attach_pool
+from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
 
 
 def load_settings():
@@ -237,7 +237,6 @@ class Window(QMainWindow):
         self.settings = load_settings()
         self.worker = None
         self.cover_worker = None
-        self.store_pool_stack = None   # 商店页专用代理（常驻复用）
         self.store_proxy_url = None
         self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
         self.library_buttons = []  # 车库卡片按钮（随网格重建）
@@ -414,9 +413,9 @@ class Window(QMainWindow):
             badge = 'Fanza R18 · ' if product in adult else ''
             if record:
                 state, buttons = badge + f"已安装 · 版本 {record.get('version', '未知')}", \
-                    [('启动', 'game-launch', True), ('更新', 'game-update', False), ('商店页', 'store-open', False)]
+                    [('启动', 'game-launch', True), ('更新', 'game-update', False), ('详情', 'detail-open', False)]
             else:
-                state, buttons = badge + '未安装 · 可全新安装', [('全新安装', 'game-update', True), ('商店页', 'store-open', False)]
+                state, buttons = badge + '未安装 · 可全新安装', [('全新安装', 'game-update', True), ('详情', 'detail-open', False)]
             self.add_card(self.store_grid, self.make_card(self.store_grid, self.store_buttons,
                 self.store_covers, product, title, state, buttons))
 
@@ -465,19 +464,60 @@ class Window(QMainWindow):
     def cover_arrived(self, product):
         for label in self.all_covers().get(product, []): self.paint_cover(label, product)
 
+    # ---------- 原生详情页 ----------
+
+    def open_game_detail(self, product):
+        installed = records().get(product)
+        if installed is None and product == 'gakumas':
+            try:
+                _, version = DmmHelper.installed_game()
+                installed = {'version': version, 'root': ''}
+            except DmmError:
+                installed = None
+        entry = next((item for item in catalog() if item['product'] == product), {})
+        title = self.known_titles().get(product, product)
+        dialog = QDialog(self); dialog.setWindowTitle(title)
+        dialog.resize(620, 340); dialog.setAttribute(Qt.WA_DeleteOnClose)
+        row = QHBoxLayout(dialog); row.setContentsMargins(20, 20, 20, 16); row.setSpacing(16)
+        cover = QLabel('暂无封面'); cover.setObjectName('cover'); cover.setAlignment(Qt.AlignCenter)
+        cover.setFixedSize(220, 220)
+        path = cover_path(data_dir(), product)
+        if path.is_file():
+            pixmap = QPixmap(str(path))
+            if not pixmap.isNull():
+                cover.setText(''); cover.setPixmap(rounded_pixmap(
+                    pixmap.scaled(216, 216, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+        row.addWidget(cover)
+        column = QVBoxLayout(); column.setSpacing(8); row.addLayout(column, 1)
+        name = QLabel(title); name.setObjectName('detailtitle'); name.setWordWrap(True); column.addWidget(name)
+        meta = [str(entry.get(key)) for key in ('maker', 'genre') if entry.get(key)]
+        if entry.get('adult'): meta.append('Fanza R18')
+        info = QLabel(' · '.join(meta) or product); info.setObjectName('muted'); info.setWordWrap(True); column.addWidget(info)
+        if installed:
+            state = f"已安装 · 版本 {installed.get('version', '未知')}\n{installed.get('root', '')}"
+        else:
+            state = '未安装 ·「全新安装」会把游戏下载到本客户端数据目录'
+        state_label = QLabel(state); state_label.setObjectName('muted'); state_label.setWordWrap(True); column.addWidget(state_label)
+        column.addStretch()
+        buttons = QHBoxLayout(); buttons.setSpacing(8); column.addLayout(buttons)
+        spec = ([('启动', 'game-launch', True), ('更新', 'game-update', False)] if installed
+                else [('全新安装', 'game-update', True)])
+        for text, action, accent in spec + [('检查', 'game-check', False), ('网页商店', 'store-open', False)]:
+            button = QPushButton(text); button.setObjectName('mini')
+            if accent: button.setProperty('accent', True)
+            button.clicked.connect(lambda _, a=action, p=product: self.run_action(a, p))
+            buttons.addWidget(button)
+        dialog.show()
+        self.report(f'已打开详情：{title}')
+
     # ---------- 应用内商店页 ----------
 
     def ensure_store_proxy(self):
-        """商店页专用代理，常驻复用：Chromium 的代理端口在进程内只能设置一次。"""
-        if self.store_pool_stack is not None: return self.store_proxy_url
-        import contextlib
-        stack = contextlib.ExitStack()
-        try:
-            proxy = stack.enter_context(operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()))
-        except Exception:
-            stack.close(); raise
-        self.store_pool_stack = stack; self.store_proxy_url = proxy
-        return proxy
+        """ProxyHub 常驻代理：with 退出不再杀进程，端口跨操作稳定。"""
+        if self.store_proxy_url is not None: return self.store_proxy_url
+        with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
+            self.store_proxy_url = proxy
+        return self.store_proxy_url
 
     def _inject_session_cookies(self, cookie_store):
         """把加密保存的 DMM 登录态注入内嵌浏览器，页面内可直接点「ゲーム開始」。"""
@@ -557,6 +597,8 @@ class Window(QMainWindow):
         try:
             if action == 'store-open':
                 self.open_store_page(f'https://games.dmm.com/detail/{product}'); return
+            if action == 'detail-open':
+                self.open_game_detail(product); return
             if action == 'game-folder':
                 folder = QFileDialog.getExistingDirectory(self, '选择含 gakumas.exe 的游戏目录')
                 if not folder: return
@@ -607,7 +649,7 @@ class Window(QMainWindow):
             self.cancel(); self.status.setText('请等待当前操作停止后再关闭客户端'); event.ignore()
         else:
             if self.cover_worker and self.cover_worker.isRunning(): self.cover_worker.wait(3000)
-            if self.store_pool_stack is not None: self.store_pool_stack.close()
+            HUB.shutdown()
             event.accept()
 
 
@@ -619,6 +661,7 @@ STYLE = '''QWidget { background:#0b101b; color:#dfe7f3; font-family:"Microsoft Y
     QLabel#muted { color:#8fa1bd; }
     QLabel#status { font-size:15px; font-weight:700; color:#eaf1fb; }
     QLabel#cardtitle { font-size:13px; font-weight:700; color:#eaf1fb; }
+    QLabel#detailtitle { font-size:19px; font-weight:800; color:#ffffff; }
     QLabel#cover { background:#0e1420; border:1px solid #24304a; border-radius:10px; color:#5a6780; font-size:12px; font-weight:600; }
     QTabWidget::pane { border:1px solid #1c2740; border-radius:14px; background:#111827; left:-1px; }
     QTabBar { background:transparent; }
