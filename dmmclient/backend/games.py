@@ -196,10 +196,33 @@ class GameService:
             data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
         except DmmApiError as error:
             if error.code==314:
-                # DMM 商店是单页应用，详情深链接在服务器端是 404；
-                # 打开商店首页（应用内浏览器已登录），用户搜索游戏名后点「ゲーム開始」加库。
-                raise StorePageNeeded('https://app-gameplayer.dmm.com/', self.title) from None
-            raise
+                # 314 = 游戏不在账号的 DMM 游戏库。官方抓包确认加库接口：
+                # POST /v5/detail/mygame/add {"product_id","game_type","game_os"}（需 5.5.21 UA + age_check_done cookie）
+                # 自动加库后重试原请求，无需用户去商店页操作。
+                self.progress('该游戏未加入 DMM 游戏库，正在自动加入…')
+                added=self.session.request('/v5/detail/mygame/add',
+                    {'product_id':self.product,'game_type':'GCL','game_os':'win'})
+                if not (isinstance(added,dict) and added.get('result')):
+                    raise DmmError('自动加入 DMM 游戏库失败，请稍后重试') from None
+                self.progress('已加入游戏库，继续获取安装信息')
+                try:
+                    data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
+                except DmmApiError as retry_error:
+                    if retry_error.code==308:
+                        # 308 = 该游戏从未经过官方下载系统，首次下载被 DMM 服务端拒绝
+                        # （实测：官方装过的游戏任意设备都 100，新加库的游戏任何头/设备都 308）。
+                        # 唯一通路是官方下载器：协议链接唤起官方 Player 完成首次安装，
+                        # 装完后（dmmgame.cnf 出现记录）本客户端自动接管更新与启动。
+                        try:
+                            os.startfile(f'dmmgameplayer://play/GCL/{self.product}/cl/win')
+                        except OSError:
+                            pass
+                        raise DmmError('该游戏首次下载必须由官方下载器执行（DMM 服务端限制）：'
+                                       '已为你打开官方 Player，请在那里点击下载（装一半取消也行），'
+                                       '完成后回到本客户端即可接管更新与启动') from None
+                    raise
+            else:
+                raise
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
         if data.get('has_modules'): raise DmmError('该游戏需要额外运行模块，暂不支持自动安装')

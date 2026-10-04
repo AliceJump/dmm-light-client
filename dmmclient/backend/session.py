@@ -106,12 +106,14 @@ class DmmSession:
         self.http.trust_env = False
         self.http.proxies = {"http": self.proxy, "https": self.proxy}
         self.http.headers.update({
-            "User-Agent": "DMMGamePlayer5-Win/5.5.20 Electron/34.3.0",
-            "Client-App": "DMMGamePlayer5", "Client-Version": "5.5.20",
+            "User-Agent": "DMMGamePlayer5-Win/5.5.21 Electron/44.3.0",
+            "Client-App": "DMMGamePlayer5", "Client-Version": "5.5.21",
             "Accept": "application/json", "Accept-Language": "ja",
         })
         self.auth = {}
         self.device = {}
+        # 官方 Player 请求商店/API 时始终携带该 cookie（抓包确认，缺失会导致 910）
+        self.http.cookies.set("age_check_done", "0", domain=".dmm.com", path="/")
         source = self.accounts.current_path()
         if self.profile_key and not source.exists():
             raise LoginRequired('当前账号的登录文件缺失，请重新登录并保存该账号')

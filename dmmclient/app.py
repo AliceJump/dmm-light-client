@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
     QProgressBar, QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
-from .backend.games import (SUPPORTED, GameService, StorePageNeeded, catalog, cover_path,
+from .backend.games import (SUPPORTED, GameService, catalog, cover_path,
     installed_record, official_records, records, refresh_catalog, save_cover)
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
@@ -130,7 +130,6 @@ class Worker(QThread):
     download = Signal(int, str)
     finished_ok = Signal(str)
     failed = Signal(str)
-    open_store = Signal(str)
 
     def __init__(self, action, settings, number='', name='', node_text='', product='', parent=None):
         super().__init__(parent)
@@ -242,11 +241,7 @@ class Worker(QThread):
             if action == 'update' and not installed_record(self.product):
                 action = 'install'  # 未安装过的游戏直接全新安装
             service = GameService(helper.session, self.product, self.message.emit, self.progress)
-            try:
-                return service.execute(action)
-            except StorePageNeeded as error:
-                self.open_store.emit(error.url)  # 应用内商店页完成加库（登录一次后持久）
-                raise DmmError(str(error)) from None
+            return service.execute(action)
         raise DmmError('未知操作')
 
 
@@ -698,7 +693,6 @@ class Window(QMainWindow):
             self.worker.message.connect(self.report)
             self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
             self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
-            self.worker.open_store.connect(self.open_store_page)
             self.worker.finished.connect(self.operation_finished)
             self.pause.setEnabled(True); self.bar.setRange(0,0)
             self.status.setText('正在处理…'); self.worker.start()
