@@ -20,6 +20,14 @@ from .updater import UpdatePlan, VerifiedUpdater, safe_path
 SUPPORTED = {'priconner': '公主连结 Re:Dive（日服）'}
 
 
+class StorePageNeeded(DmmError):
+    """314：该游戏还不在账号的 DMM 游戏库，需要先在商店页点一次「ゲーム開始」。"""
+    def __init__(self, url):
+        self.url = url
+        super().__init__('DMM 要求先将该游戏加入游戏库：已在本客户端「商店页」打开详情页，'
+                         '请在页面点击「ゲームを始める」（可能需要年龄认证），完成后重新点「全新安装」')
+
+
 def checked_product(value):
     if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}',value):
         raise DmmError('游戏编号无效')
@@ -187,14 +195,7 @@ class GameService:
             data=self.session.request('/v5/r2/install/cl' if installing else '/v5/r2/launch/cl',payload)
         except DmmApiError as error:
             if error.code==314:
-                # DMM 要求游戏先加入账号游戏库：系统浏览器已登录 DMM，
-                # 打开该游戏的商店详情页点「ゲーム開始」即可加库。
-                try:
-                    os.startfile(store_detail_url(self.product))
-                except OSError:
-                    pass
-                raise DmmError('DMM 要求先将该游戏加入游戏库：已在浏览器打开该游戏的商店页，'
-                               '请点击「ゲーム開始」（首次可能需年龄认证），完成后重新点「全新安装」') from None
+                raise StorePageNeeded(store_detail_url(self.product)) from None
             raise
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
