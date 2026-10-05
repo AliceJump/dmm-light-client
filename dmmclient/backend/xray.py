@@ -393,11 +393,15 @@ class NodePool:
 
     def failover(self):
         self.close()
-        while self.index + 1 < len(self.nodes):
+        tried = 0
+        while tried < len(self.nodes):
+            tried += 1
             self.cancel_check()
-            self.index += 1
+            # 循环推进：常驻进程下即使上一轮全部失败，新一轮仍会从头再试
+            # （免费/机场节点时好时坏，卡在末尾会让代理永久失效）。
+            self.index = (self.index + 1) % len(self.nodes)
             node = self.nodes[self.index]
-            self.progress(f"尝试节点 {self.index + 1}/{len(self.nodes)}：{node['name']}")
+            self.progress(f"尝试节点 {tried}/{len(self.nodes)}：{node['name']}")
             context = node_process(node, self.exe, self.port, self.progress, self.cancel_check)
             try:
                 context.__enter__()
