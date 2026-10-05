@@ -29,6 +29,17 @@ class StorePageNeeded(DmmError):
                          '（可能需要年龄认证），完成后重新点「全新安装」')
 
 
+class OfficialDownloadNeeded(DmmError):
+    """308：首次下载必须由官方下载器执行（服务端按游戏记录，任何第三方请求都被拒）。"""
+    def __init__(self, product, game_type):
+        self.product = product
+        try: os.startfile(f'dmmgameplayer://play/{game_type}/{product}/cl/win')
+        except OSError: pass
+        super().__init__('该游戏首次下载必须由官方下载器执行（DMM 服务端限制）：'
+                         '已为你打开官方 Player，请在那里点击下载（装一半取消也行）。'
+                         '本客户端正在后台等待，下载完成后会自动接管更新与启动')
+
+
 def checked_product(value):
     if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}',value):
         raise DmmError('游戏编号无效')
@@ -222,10 +233,10 @@ class GameService:
                     try:
                         data=self.session.request(endpoint,payload)
                     except DmmApiError as retry_error:
-                        if retry_error.code==308: self._first_download_fallback(game_type)
+                        if retry_error.code==308: raise OfficialDownloadNeeded(self.product,game_type) from None
                         raise
                 elif error.code==308:
-                    self._first_download_fallback(game_type)
+                    raise OfficialDownloadNeeded(self.product,game_type) from None
                 else:
                     raise
         finally:
@@ -237,18 +248,16 @@ class GameService:
         if not data.get('file_list_url') or not data.get('sign'): raise DmmError('服务器未提供可用的标准下载清单')
         return data
 
-    def _first_download_fallback(self, game_type):
-        """308 = 该游戏从未经过官方下载系统，首次下载被 DMM 服务端拒绝
-        （实测：官方装过的游戏任意设备都 100，新加库的游戏任何头/设备都 308，与 GCL/ACL 无关）。
-        唯一通路是官方下载器：协议链接唤起官方 Player 完成首次安装，
-        装完后（dmmgame.cnf 出现记录）本客户端自动接管更新与启动。"""
+    def remote_info(self):
+        """gameinfo 查询：最新版本与大小，未安装的游戏也可用（不触发 308 下载限制）。"""
+        self.session.ensure_login()
+        if self.adult: set_age_cookie(self.session, True)
         try:
-            os.startfile(f'dmmgameplayer://play/{game_type}/{self.product}/cl/win')
-        except OSError:
-            pass
-        raise DmmError('该游戏首次下载必须由官方下载器执行（DMM 服务端限制）：'
-                       '已为你打开官方 Player，请在那里点击下载（装一半取消也行），'
-                       '完成后回到本客户端即可接管更新与启动') from None
+            game_type = self._detect_game_type()
+            return self.session.request('/v5/gameinfo', {
+                'product_id': self.product, 'game_type': game_type, 'game_os': 'win', **self.session.device})
+        finally:
+            if self.adult: set_age_cookie(self.session, False)
 
     def _detect_game_type(self):
         """gametype 探测：Fanza 游戏返回 ACL（co.jp 域名），一般游戏 GCL（.com）。"""
@@ -297,6 +306,12 @@ class GameService:
     def execute(self, action, install_root=None):
         saved=records().get(self.product) or official_record(self.product)
         installing=not saved or action=='install'
+        if action=='check' and not saved:
+            # 未安装的游戏：用 gameinfo 查最新版本（不触发 308 下载限制）
+            info=self.remote_info()
+            size=info.get('file_size') or 0
+            return (f"最新版本 {info.get('latest_version','?')} · {size/1048576:.1f} MiB · 尚未安装："
+                    '点「全新安装」开始下载')
         if installing:
             if install_root is None and action in {'check','install'}:
                 install_root=data_dir()/'games'/self.product

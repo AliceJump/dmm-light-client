@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path,
-    installed_record, official_records, records, refresh_catalog, save_cover)
+    installed_record, OfficialDownloadNeeded, official_record, official_records, records,
+    refresh_catalog, save_cover)
 from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
@@ -130,6 +131,7 @@ class Worker(QThread):
     download = Signal(int, str)
     finished_ok = Signal(str)
     failed = Signal(str)
+    official_fallback = Signal(str)
 
     def __init__(self, action, settings, number='', name='', node_text='', product='', parent=None):
         super().__init__(parent)
@@ -201,6 +203,10 @@ class Worker(QThread):
                             browser_login(helper, self.message.emit)
                             result = self.game_action(helper)
                     self.finished_ok.emit(result)
+        except OfficialDownloadNeeded as error:
+            log_error(f'操作失败 action={self.action} product={self.product or "-"}: {error}')
+            self.official_fallback.emit(error.product)
+            self.failed.emit(str(error))
         except (DmmError, requests.RequestException) as error:
             log_error(f'操作失败 action={self.action} product={self.product or "-"}: {error}')
             self.failed.emit(str(error) if isinstance(error, DmmError) else '网络连接失败，请测试代理或切换节点')
@@ -277,6 +283,7 @@ class Window(QMainWindow):
         self.settings = load_settings()
         self.worker = None
         self.cover_worker = None
+        self.watchers = {}
         self.store_proxy_url = None
         self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
         self.library_buttons = []  # 车库卡片按钮（随网格重建）
@@ -693,6 +700,7 @@ class Window(QMainWindow):
             self.worker.message.connect(self.report)
             self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
             self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
+            self.worker.official_fallback.connect(self.watch_official_download)
             self.worker.finished.connect(self.operation_finished)
             self.pause.setEnabled(True); self.bar.setRange(0,0)
             self.status.setText('正在处理…'); self.worker.start()
@@ -703,6 +711,33 @@ class Window(QMainWindow):
 
     def report(self, message):
         self.status.setText(message); self.log.append(message)
+
+    def watch_official_download(self, product):
+        """308 官方回退后：后台轮询 dmmgame.cnf，官方下载一完成立即自动接管。"""
+        from PySide6.QtCore import QTimer
+        watcher = {'product': product, 'ticks': 0}
+        timer = QTimer(self)
+
+        def poll():
+            watcher['ticks'] += 1
+            try:
+                record = official_record(product)
+            except Exception:
+                record = None
+            if record:
+                timer.stop()
+                self.watchers.pop(product, None)
+                self.report(f'检测到「{product}」官方下载已完成，本客户端已接管：车库页可直接启动/更新')
+                self.refresh()
+            elif watcher['ticks'] >= 720:  # 2 小时后放弃
+                timer.stop()
+                self.watchers.pop(product, None)
+                self.report(f'等待官方 Player 下载「{product}」超时；完成后重新点「检查更新」即可接管')
+
+        timer.timeout.connect(poll)
+        timer.start(10000)
+        self.watchers[product] = timer
+        self.report(f'正在等待官方 Player 下载「{product}」…完成后本客户端将自动接管')
 
     def set_busy(self, busy):
         """兼容保留：操作期间不再禁用全局控件，仅由 run_action 提示占用。"""
