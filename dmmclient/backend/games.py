@@ -29,17 +29,6 @@ class StorePageNeeded(DmmError):
                          '（可能需要年龄认证），完成后重新点「全新安装」')
 
 
-class OfficialDownloadNeeded(DmmError):
-    """308：首次下载必须由官方下载器执行（服务端按游戏记录，任何第三方请求都被拒）。"""
-    def __init__(self, product, game_type):
-        self.product = product
-        try: os.startfile(f'dmmgameplayer://play/{game_type}/{product}/cl/win')
-        except OSError: pass
-        super().__init__('该游戏首次下载必须由官方下载器执行（DMM 服务端限制）：'
-                         '已为你打开官方 Player，请在那里点击下载（装一半取消也行）。'
-                         '本客户端正在后台等待，下载完成后会自动接管更新与启动')
-
-
 def checked_product(value):
     if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}',value):
         raise DmmError('游戏编号无效')
@@ -233,10 +222,16 @@ class GameService:
                     try:
                         data=self.session.request(endpoint,payload)
                     except DmmApiError as retry_error:
-                        if retry_error.code==308: raise OfficialDownloadNeeded(self.product,game_type) from None
-                        raise
-                elif error.code==308:
-                    raise OfficialDownloadNeeded(self.product,game_type) from None
+                        if retry_error.code==308 and installing:
+                            data=self._first_download_info(payload)
+                        else:
+                            raise
+                elif error.code==308 and installing:
+                    # 308 = 该游戏从未由官方下载器下载过，install/cl 被服务端拒绝。
+                    # 下载清单与 CloudFront 签名改由 /v5/r2/filelist/cl 直接取得：
+                    # 官方 cex.dll 下载时走的正是这条路径（GetCLDownloadFileResourceInfo），
+                    # 它不检查「是否曾由官方下载器下载过」，因此无需官方 Player 即可首次安装。
+                    data=self._first_download_info(payload)
                 else:
                     raise
         finally:
@@ -247,6 +242,11 @@ class GameService:
         if data.get('drm_auth_token'): raise DmmError('该游戏需要额外 DRM 授权，暂不支持启动')
         if not data.get('file_list_url') or not data.get('sign'): raise DmmError('服务器未提供可用的标准下载清单')
         return data
+
+    def _first_download_info(self, payload):
+        """308 首次下载限制的绕过：用下载清单接口拿 file_list_url 与 CloudFront 签名。"""
+        self.progress('该游戏首次安装：使用标准下载清单接口（无需官方下载器）')
+        return self.session.request('/v5/r2/filelist/cl', payload)
 
     def remote_info(self):
         """gameinfo 查询：最新版本与大小，未安装的游戏也可用（不触发 308 下载限制）。"""
