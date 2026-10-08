@@ -206,34 +206,7 @@ class GameService:
             payload={'product_id':self.product,'game_type':game_type,'game_os':'win',**self.session.device}
             if not installing: payload['launch_type']='LIB'
             endpoint='/v5/r2/install/cl' if installing else '/v5/r2/launch/cl'
-            try:
-                data=self.session.request(endpoint,payload)
-            except DmmApiError as error:
-                if error.code==314:
-                    # 314 = 游戏不在账号的 DMM 游戏库。官方抓包确认加库接口：
-                    # POST /v5/detail/mygame/add {"product_id","game_type","game_os"}
-                    # 自动加库后重试原请求，无需用户去商店页操作。
-                    self.progress('该游戏未加入 DMM 游戏库，正在自动加入…')
-                    added=self.session.request('/v5/detail/mygame/add',
-                        {'product_id':self.product,'game_type':game_type,'game_os':'win'})
-                    if not (isinstance(added,dict) and added.get('result')):
-                        raise DmmError('自动加入 DMM 游戏库失败，请稍后重试') from None
-                    self.progress('已加入游戏库，继续获取安装信息')
-                    try:
-                        data=self.session.request(endpoint,payload)
-                    except DmmApiError as retry_error:
-                        if retry_error.code==308 and installing:
-                            data=self._first_download_info(payload)
-                        else:
-                            raise
-                elif error.code==308 and installing:
-                    # 308 = 该游戏从未由官方下载器下载过，install/cl 被服务端拒绝。
-                    # 下载清单与 CloudFront 签名改由 /v5/r2/filelist/cl 直接取得：
-                    # 官方 cex.dll 下载时走的正是这条路径（GetCLDownloadFileResourceInfo），
-                    # 它不检查「是否曾由官方下载器下载过」，因此无需官方 Player 即可首次安装。
-                    data=self._first_download_info(payload)
-                else:
-                    raise
+            data=self._request_info(endpoint,payload,installing)
         finally:
             if self.adult: set_age_cookie(self.session, False)
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
@@ -243,9 +216,57 @@ class GameService:
         if not data.get('file_list_url') or not data.get('sign'): raise DmmError('服务器未提供可用的标准下载清单')
         return data
 
+    def _request_info(self, endpoint, payload, installing):
+        """安装/启动信息获取，自动修复 314（未加库）与 308（未同意规约）后重试。"""
+        try:
+            return self.session.request(endpoint,payload)
+        except DmmApiError as error:
+            if error.code==314:
+                # 314 = 游戏不在账号的 DMM 游戏库。官方抓包确认加库接口：
+                # POST /v5/detail/mygame/add {"product_id","game_type","game_os"}
+                # 自动加库后重试原请求，无需用户去商店页操作。
+                self.progress('该游戏未加入 DMM 游戏库，正在自动加入…')
+                added=self.session.request('/v5/detail/mygame/add',
+                    {'product_id':self.product,'game_type':payload['game_type'],'game_os':'win'})
+                if not (isinstance(added,dict) and added.get('result')):
+                    raise DmmError('自动加入 DMM 游戏库失败，请稍后重试') from None
+                self.progress('已加入游戏库，继续获取安装信息')
+                return self._retry_after_consent(endpoint,payload,installing)
+            if error.code==308:
+                return self._retry_after_consent(endpoint,payload,installing)
+            raise
+
+    def _retry_after_consent(self, endpoint, payload, installing):
+        """308 = NOT_CONSENT_AGREEMENT（官方错误码表）：首次使用该游戏必须先同意其利用规约。
+
+        官方 Player 是弹窗让用户点「同意」，对应 POST /v5/agreement/confirm/client
+        {"product_id","is_notification":false}。这里在用户主动点安装/启动时自动代为同意，
+        同意后 install/cl 与 launch/cl 都会恢复 100。
+        """
+        self.progress('首次使用该游戏：正在提交利用规约同意…')
+        try:
+            agreed=self.session.request('/v5/agreement/confirm/client',
+                {'product_id':self.product,'is_notification':False})
+        except DmmError:
+            agreed=None
+        if not (isinstance(agreed,dict) and agreed.get('result')):
+            if installing:
+                return self._first_download_info(payload)
+            raise DmmError('该游戏需要先在 DMM 同意其利用规约，且自动同意未成功；请稍后重试')
+        try:
+            return self.session.request(endpoint,payload)
+        except DmmApiError as retry_error:
+            if retry_error.code==308 and installing:
+                return self._first_download_info(payload)
+            raise
+
     def _first_download_info(self, payload):
-        """308 首次下载限制的绕过：用下载清单接口拿 file_list_url 与 CloudFront 签名。"""
-        self.progress('该游戏首次安装：使用标准下载清单接口（无需官方下载器）')
+        """兜底：仍被 308 拒绝时，改用下载清单接口直接取 file_list_url 与 CloudFront 签名。
+
+        官方 cex.dll 下载时走的正是这条路径（GetCLDownloadFileResourceInfo），因此
+        即使 install/cl 不可用也能完成首次安装。
+        """
+        self.progress('改用标准下载清单接口获取安装信息')
         return self.session.request('/v5/r2/filelist/cl', payload)
 
     def remote_info(self):
