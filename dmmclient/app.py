@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import winreg
+from collections import deque
 from pathlib import Path
 
 import requests
@@ -25,7 +26,7 @@ from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path,
     installed_record, official_record, official_records, records,
     refresh_catalog, save_cover)
-from .backend.helper import DmmHelper, helper_lock, ensure_game_stopped
+from .backend.helper import DmmHelper, helper_lock
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
     atomic_write, data_dir, dmm_url, valid_proxy)
@@ -262,7 +263,6 @@ class Worker(QThread):
                     helper = DmmHelper(proxy, self.message.emit, root=root, download_progress=self.progress)
                     helper.session.cancel_check = self.check_cancel
                     if self.action == 'new-account':
-                        ensure_game_stopped()
                         accounts.validate(self.number, self.name)
                         if any(a['number'] == self.number for a in accounts.read()['accounts']):
                             raise DmmError('编号已存在，请使用新编号')
@@ -360,6 +360,7 @@ class Window(QMainWindow):
         super().__init__()
         self.settings = load_settings()
         self.worker = None
+        self.pending_actions = deque()
         self.cover_worker = None
         self.store_proxy_url = None
         self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
@@ -752,7 +753,12 @@ class Window(QMainWindow):
         button.clicked.connect(lambda: self.run_action(action)); layout.addWidget(button); self.buttons.append(button)
 
     def cancel(self):
-        if self.worker: self.worker.cancelled.set(); self.status.setText('正在暂停并保存下载断点…')
+        dropped = len(self.pending_actions)
+        self.pending_actions.clear()
+        if self.worker:
+            self.worker.cancelled.set()
+            tail = f'；队列中 {dropped} 个操作也已取消' if dropped else ''
+            self.status.setText('正在暂停并保存下载断点…' + tail)
 
     def toggle_system_proxy(self, checked):
         if checked:
@@ -767,9 +773,8 @@ class Window(QMainWindow):
             restore_system_proxy(); self.report('系统代理已恢复原设置')
 
     def run_action(self, action, product=''):
-        if self.worker and self.worker.isRunning():
-            self.report('已有操作正在进行，请等它结束或点「暂停当前操作」'); return
         try:
+            # 打开详情与保存代理设置不与其他操作冲突，任何时候都立即执行
             if action == 'detail-open':
                 self.open_game_detail(product); return
             if action == 'game-folder':
@@ -793,17 +798,27 @@ class Window(QMainWindow):
             number = self.accounts.currentData() if action == 'switch-account' else self.number.text().strip()
             if action == 'switch-account' and not number: raise DmmError('请先保存并选择账号')
             if action.startswith('game-') and not product: raise DmmError('请先选择游戏')
-            self.worker = Worker(action, self.settings, number, self.name.text().strip(), node_text, product, self)
-            self.worker.message.connect(self.report)
-            self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
-            self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
-            self.worker.finished.connect(self.operation_finished)
-            self.pause.setEnabled(True); self.bar.setRange(0,0)
-            self.status.setText('正在处理…'); self.worker.start()
+            request = (action, dict(self.settings), number, self.name.text().strip(), node_text, product)
+            if self.worker and self.worker.isRunning():
+                # 不拒绝：排进队列，当前操作结束后自动接着跑
+                self.pending_actions.append(request)
+                self.report(f'已排入队列（{len(self.pending_actions)} 个待执行），当前操作结束后自动开始')
+                return
+            self.start_operation(request)
         except (DmmError, OSError, UnicodeError) as error:
             self.report(str(error) if isinstance(error,DmmError) else '配置文件无法读取')
         except Exception:
             self.report('操作未能开始，详情见 client.log'); raise
+
+    def start_operation(self, request):
+        action, settings, number, name, node_text, product = request
+        self.worker = Worker(action, settings, number, name, node_text, product, self)
+        self.worker.message.connect(self.report)
+        self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
+        self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
+        self.worker.finished.connect(self.operation_finished)
+        self.pause.setEnabled(True); self.bar.setRange(0,0)
+        self.status.setText('正在处理…'); self.worker.start()
 
     def report(self, message):
         self.status.setText(message); self.log.append(message)
@@ -813,8 +828,12 @@ class Window(QMainWindow):
         self.pause.setEnabled(not busy)
 
     def operation_finished(self):
+        finished, self.worker = self.worker, None
+        if finished is not None: finished.deleteLater()
+        if self.pending_actions:
+            self.start_operation(self.pending_actions.popleft())
+            return
         self.pause.setEnabled(False); self.bar.setRange(0,100); self.node_text.clear(); self.refresh()
-        self.worker.deleteLater(); self.worker = None
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

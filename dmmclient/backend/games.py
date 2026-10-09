@@ -13,7 +13,7 @@ from urllib.parse import urlencode, urljoin
 import psutil
 import requests
 
-from .helper import windows_args, ensure_update_idle
+from .helper import windows_args
 from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir, dmm_url
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
 
@@ -380,7 +380,7 @@ class GameService:
         return UpdatePlan.parse(root,manifest['domain'],entries,info['latest_version'])
 
     def stopped(self, root):
-        ensure_update_idle()
+        """只拦「要操作的这个游戏正在运行」；别的游戏在跑不互相阻碍。"""
         for process in psutil.process_iter(['exe']):
             try:
                 if process.info['exe'] and Path(process.info['exe']).resolve().is_relative_to(root.resolve()):

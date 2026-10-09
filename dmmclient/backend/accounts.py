@@ -73,8 +73,6 @@ class AccountStore:
             raise DmmError('没有可用的加密登录文件，请先登录或导入 DMM 登录态') from None
 
     def save_current(self, number, name, source=None, *, new=False):
-        from dmmclient.backend.helper import ensure_game_stopped
-        ensure_game_stopped()
         self.validate(number, name)
         value = self.read()
         existing = next((e for e in value['accounts'] if e['number'] == number), None)
@@ -92,8 +90,6 @@ class AccountStore:
         return entry
 
     def switch(self, number):
-        from dmmclient.backend.helper import ensure_game_stopped
-        ensure_game_stopped()
         value = self.read()
         entry = next((e for e in value['accounts'] if e['number'] == number), None)
         if entry is None:

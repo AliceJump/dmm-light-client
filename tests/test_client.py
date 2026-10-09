@@ -95,6 +95,67 @@ class ClientTests(unittest.TestCase):
         grid.deleteLater(); app.processEvents()
 
 
+    def test_actions_queue_instead_of_being_rejected(self):
+        """有操作在跑时，新的操作应排队而不是被拒绝。"""
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None):
+            window = Window()
+            busy = Mock(); busy.isRunning.return_value = True
+            window.worker = busy
+            window.run_action('game-check', 'priconne')
+            self.assertEqual(len(window.pending_actions), 1)
+            self.assertIn('已排入队列', window.status.text())
+            window.pending_actions.clear(); window.worker = None
+            window.close(); window.deleteLater(); app.processEvents()
+
+    def test_non_conflicting_actions_never_queue(self):
+        """保存代理设置不与其他操作冲突，应立刻执行而不是排队。"""
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None):
+            window = Window()
+            busy = Mock(); busy.isRunning.return_value = True
+            window.worker = busy
+            window.run_action('settings')
+            self.assertEqual(len(window.pending_actions), 0)
+            self.assertIn('已保存', window.status.text())
+            window.worker = None
+            window.close(); window.deleteLater(); app.processEvents()
+
+    def test_switch_account_does_not_require_game_closed(self):
+        """游戏在运行时也应允许切换账号（存档只是文件替换，不影响已启动的游戏）。"""
+        from dmmclient.backend.accounts import AccountStore
+        running = Mock(); running.info = {'name': 'game.exe', 'exe': r'C:\games\x\game.exe'}
+        with tempfile.TemporaryDirectory() as folder, \
+                patch('dmmclient.backend.games.records', return_value={'x': {'root': r'C:\games\x'}}), \
+                patch('psutil.process_iter', return_value=[running]):
+            store = AccountStore(Path(folder))
+            with self.assertRaises(DmmError) as caught:
+                store.switch('1')
+        self.assertIn('已保存的账号', str(caught.exception))
+        self.assertNotIn('游戏正在运行', str(caught.exception))
+
+    def test_queued_actions_chain_after_the_current_one(self):
+        """当前操作结束后，队列里的下一个自动开始（FIFO）。"""
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None):
+            window = Window()
+            started = []
+            window.start_operation = lambda request: started.append(request[0])
+            window.pending_actions.extend([('game-check', {}, '', '', '', 'a'),
+                                           ('game-update', {}, '', '', '', 'b')])
+            window.worker = Mock()
+            window.operation_finished()
+            self.assertEqual(started, ['game-check'])
+            self.assertEqual([request[0] for request in window.pending_actions], ['game-update'])
+            window.pending_actions.clear(); window.worker = None
+            window.close(); window.deleteLater(); app.processEvents()
+
     def test_refresh_keeps_card_wall_scroll_position(self):
         """安装完成后的刷新不应把卡片墙弹回顶部（clear() 会把滚动条归零）。"""
         import json
