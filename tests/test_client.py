@@ -57,5 +57,42 @@ class ClientTests(unittest.TestCase):
         from dmmclient.backend.session import OperationCancelled
         with self.assertRaises(OperationCancelled): worker.check_cancel()
 
+    def test_touch_scrolling_grabs_viewport(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QListWidget, QScroller, QScrollerProperties
+        from dmmclient.app import enable_touch_scrolling
+        app = QApplication.instance() or QApplication([])
+        grid = QListWidget()
+        scroller = enable_touch_scrolling(grid)
+        self.assertTrue(grid.viewport().testAttribute(Qt.WA_AcceptTouchEvents))
+        self.assertEqual(
+            scroller.scrollerProperties().scrollMetric(
+                QScrollerProperties.ScrollMetric.VerticalOvershootPolicy),
+            QScrollerProperties.OvershootPolicy.OvershootAlwaysOff)
+        grid.deleteLater(); app.processEvents()
+
+    def test_touch_tap_is_forwarded_but_drag_is_not(self):
+        """轻点补成点击、拖动不补 —— 这是 QScroller 吞掉触摸后按钮仍可点的关键。"""
+        from PySide6.QtCore import QPointF
+        from PySide6.QtWidgets import QListWidget, QScroller
+        from dmmclient.app import TouchTapForwarder
+        app = QApplication.instance() or QApplication([])
+        grid = QListWidget()
+        scroller = QScroller.scroller(grid.viewport())
+        clicks = []
+        with patch.object(TouchTapForwarder, '_click', staticmethod(lambda pos: clicks.append(pos))):
+            forwarder = TouchTapForwarder(grid.viewport(), scroller)
+            forwarder.press_global = QPointF(5, 5)
+            scroller.stateChanged.emit(QScroller.State.Pressed)
+            scroller.stateChanged.emit(QScroller.State.Inactive)
+            self.assertEqual(len(clicks), 1, '轻点应补成一次点击')
+            clicks.clear(); forwarder.press_global = QPointF(5, 5)
+            scroller.stateChanged.emit(QScroller.State.Pressed)
+            scroller.stateChanged.emit(QScroller.State.Dragging)
+            scroller.stateChanged.emit(QScroller.State.Scrolling)
+            scroller.stateChanged.emit(QScroller.State.Inactive)
+            self.assertEqual(clicks, [], '拖动结束后不应补点击')
+        grid.deleteLater(); app.processEvents()
+
 
 if __name__ == '__main__': unittest.main()

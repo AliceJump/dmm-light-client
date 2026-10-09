@@ -13,12 +13,13 @@ import winreg
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath,
-    QPixmap)
+from PySide6.QtCore import QEvent, QObject, QPointF, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QMouseEvent, QPainter,
+    QPainterPath, QPixmap)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QProgressBar, QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+    QProgressBar, QPushButton, QScroller, QScrollerProperties, QScrollArea, QTabWidget,
+    QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path,
@@ -64,6 +65,87 @@ def app_icon():
     return QIcon(pixmap)
 
 
+class TouchTapForwarder(QObject):
+    """QScroller 抓走触摸后轻点不再产生鼠标事件，这里把轻点补成一次真实点击。
+
+    注意：QScroller 一旦抓住触点，后续 TouchUpdate/TouchEnd 会直接投递给 QScroller
+    对象本身，装在 viewport 上的事件过滤器只还能看到 TouchBegin。因此判定「轻点」
+    靠 QScroller 自己的状态机：走完 Pressed -> Inactive 且中途没进过 Dragging 即为轻点。
+    """
+
+    def __init__(self, target, scroller):
+        super().__init__(target)
+        self.press_global = None
+        self.dragged = False
+        scroller.stateChanged.connect(self._state_changed)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.TouchBegin:
+            points = event.points()
+            self.press_global = points[0].globalPosition() if len(points) == 1 else None
+            self.dragged = False
+        return False
+
+    def _state_changed(self, state):
+        if state in (QScroller.State.Dragging, QScroller.State.Scrolling):
+            self.dragged = True
+        elif state == QScroller.State.Inactive:
+            if self.press_global is not None and not self.dragged:
+                self._click(self.press_global)
+            self.press_global = None
+            self.dragged = False
+
+    @staticmethod
+    def _click(global_pos):
+        widget = QApplication.widgetAt(global_pos.toPoint())
+        if widget is None:
+            return
+        local = widget.mapFromGlobal(global_pos.toPoint())
+        QApplication.sendEvent(widget, QMouseEvent(
+            QEvent.Type.MouseButtonPress, local, global_pos, Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        QApplication.sendEvent(widget, QMouseEvent(
+            QEvent.Type.MouseButtonRelease, local, global_pos, Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+
+
+def enable_touch_scrolling(widget):
+    """开启触摸拖拽滚动（含惯性），Qt 默认只认滚轮与滚动条，触摸屏上拖不动。
+
+    - 在控件上抓取 QScroller 触摸手势；列表类控件要抓在 viewport 上。
+    - 卡片等子控件默认不接受触摸事件，事件会冒泡到被抓住手势的父控件。
+    - 关掉回弹、加大减速，得到接近手机列表的手感。
+    - 再补一个轻点转发器：QScroller 会吞掉触摸，导致卡片上的按钮点不动。
+    """
+    target = widget.viewport() if hasattr(widget, 'viewport') else widget
+    target.setAttribute(Qt.WA_AcceptTouchEvents, True)
+    QScroller.ungrabGesture(target)
+    QScroller.grabGesture(target, QScroller.ScrollerGestureType.TouchGesture)
+    scroller = QScroller.scroller(target)
+    properties = scroller.scrollerProperties()
+    for metric, value in (
+            (QScrollerProperties.ScrollMetric.VerticalOvershootPolicy,
+             QScrollerProperties.OvershootPolicy.OvershootAlwaysOff),
+            (QScrollerProperties.ScrollMetric.HorizontalOvershootPolicy,
+             QScrollerProperties.OvershootPolicy.OvershootAlwaysOff),
+            (QScrollerProperties.ScrollMetric.DragVelocitySmoothingFactor, 0.06),
+            (QScrollerProperties.ScrollMetric.DecelerationFactor, 0.125),
+            (QScrollerProperties.ScrollMetric.MaximumVelocity, 1.2)):
+        properties.setScrollMetric(metric, value)
+    scroller.setScrollerProperties(properties)
+    target.installEventFilter(TouchTapForwarder(target, scroller))
+    return scroller
+
+
+def scrollable_page(page):
+    """把整页放进可滚动容器：小窗口 / 触摸屏上内容放不下时可以拖动查看。"""
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    area.setWidget(page)
+    enable_touch_scrolling(area)
+    return area
+
+
 def game_grid():
     grid = QListWidget()
     grid.setViewMode(QListWidget.IconMode); grid.setMovement(QListWidget.Static)
@@ -71,6 +153,7 @@ def game_grid():
     grid.setGridSize(QSize(258, 294)); grid.setSpacing(10)
     grid.setVerticalScrollMode(QListWidget.ScrollPerPixel)
     grid.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    enable_touch_scrolling(grid)
     return grid
 
 
@@ -308,6 +391,7 @@ class Window(QMainWindow):
         self.pause = QPushButton('暂停当前操作'); self.pause.setObjectName('pause'); self.pause.setEnabled(False)
         self.pause.clicked.connect(self.cancel); layout.addWidget(self.pause)
         self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(110); layout.addWidget(self.log)
+        enable_touch_scrolling(self.log)
         self.refresh()
 
     # ---------- 页面构建 ----------
@@ -356,7 +440,7 @@ class Window(QMainWindow):
         self.button(row, '浏览器登录 / 续期', 'login'); self.button(row, '导入官方客户端登录态', 'import-login')
         hint = QLabel('密码与验证码只在 DMM 官方网页输入。登录成功后复制成功页地址即可返回客户端。')
         hint.setObjectName('muted'); hint.setWordWrap(True); a.addWidget(hint)
-        a.addStretch(); return page
+        a.addStretch(); return scrollable_page(page)
 
     def build_network_page(self):
         page = QWidget(); n = QVBoxLayout(page); n.setContentsMargins(28, 24, 28, 24); n.setSpacing(12)
@@ -379,7 +463,7 @@ class Window(QMainWindow):
         self.button(row, '添加节点', 'import-node'); self.button(row, '导入 JSON 文件', 'node-file')
         hint = QLabel('最多 32 个节点，轮换使用，连接失败自动尝试下一节点。\n浏览器登录使用 HTTP 代理或内置节点池；SOCKS5 支持 API、更新和下载。')
         hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
-        n.addStretch(); return page
+        n.addStretch(); return scrollable_page(page)
 
     # ---------- 卡片 ----------
 
@@ -578,7 +662,10 @@ class Window(QMainWindow):
             self.report(f'商店页代理启动失败：{error}'); return
         flags = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
         if 'proxy-server' not in flags:
-            os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (flags + f' --proxy-server={proxy}').strip()
+            flags = (flags + f' --proxy-server={proxy}').strip()
+        if 'touch-events' not in flags:
+            flags = (flags + ' --touch-events=enabled').strip()   # 触摸屏上可直接拖动商店页
+        os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = flags
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView
             from PySide6.QtWebEngineCore import QWebEngineProfile
