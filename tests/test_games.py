@@ -45,4 +45,53 @@ class GameTests(unittest.TestCase):
             self.assertEqual(spawn.call_args.args[0][1:],["new"])
 
 
+class ModuleTests(unittest.TestCase):
+    """「额外运行模块」= 游戏要求的系统运行库（VC++ / DirectX），下载后以管理员身份运行。"""
+
+    MODULE = {'domain': 'https://cdn-gameplayer.games.dmm.com', 'dir_name': 'vc',
+              'exec_file_name': 'VC_redist.x64.exe', 'module_version': '1.0',
+              'module_file_url': '/product/x/module/vc/data/VC_redist.x64.exe', 'sign': 'k=v'}
+
+    def _service(self):
+        session = Mock(); session.device = {}
+        with patch('dmmclient.backend.games.catalog', return_value=[
+                {'product': 'assaultlily', 'title': 'A', 'adult': False, 'link': ''}]):
+            return GameService(session, 'assaultlily')
+
+    def test_module_is_downloaded_then_run(self):
+        service = self._service()
+        with tempfile.TemporaryDirectory() as folder:
+            events = []
+            service._download_module = lambda url, target, sign: events.append(('download', target.name, url, sign))
+            service._run_module = lambda target: events.append(('run', target.name))
+            done = service.install_modules({'modules': [self.MODULE]}, Path(folder), None)
+            self.assertEqual([event[0] for event in events], ['download', 'run'])
+            self.assertEqual(events[0][2], 'https://cdn-gameplayer.games.dmm.com/product/x/module/vc/data/VC_redist.x64.exe')
+            self.assertEqual(events[0][3], 'k=v')
+            self.assertEqual(done, {'vc/VC_redist.x64.exe': '1.0'})
+
+    def test_same_version_module_is_not_run_again(self):
+        service = self._service()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); target = root / 'vc' / 'VC_redist.x64.exe'
+            target.parent.mkdir(parents=True); target.write_bytes(b'MZ')
+            events = []
+            service._download_module = lambda *a: events.append('download')
+            service._run_module = lambda *a: events.append('run')
+            service.install_modules({'modules': [self.MODULE]}, root, {'vc/VC_redist.x64.exe': '1.0'})
+            self.assertEqual(events, [], '同版本已装过不应重复下载或运行')
+
+    def test_module_path_is_validated(self):
+        service = self._service()
+        with tempfile.TemporaryDirectory() as folder:
+            bad = dict(self.MODULE, dir_name='../../evil')
+            with self.assertRaises(DmmError): service.install_modules({'modules': [bad]}, Path(folder), None)
+
+    def test_non_executable_module_is_rejected(self):
+        service = self._service()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'x.dll'; path.write_bytes(b'MZ')
+            with self.assertRaises(DmmError): service._run_module(path)
+
+
 if __name__=='__main__': unittest.main()

@@ -8,13 +8,13 @@ import re
 import subprocess
 from html import unescape
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 import psutil
 import requests
 
 from .helper import windows_args, ensure_update_idle
-from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir
+from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir, dmm_url
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
 
 SUPPORTED = {'priconner': '公主连结 Re:Dive（日服）'}
@@ -211,8 +211,13 @@ class GameService:
             if self.adult: set_age_cookie(self.session, False)
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
-        if data.get('has_modules'): raise DmmError('该游戏需要额外运行模块，暂不支持自动安装')
         if data.get('drm_auth_token'): raise DmmError('该游戏需要额外 DRM 授权，暂不支持启动')
+        if data.get('has_modules') and not data.get('modules'):
+            # 少数游戏（如 アサルトリリィ / DOAXVV）需要先装运行库：VC++ 或 DirectX。
+            # 安装信息里没带上时，用 /v5/modules 单独取一次。
+            extra=self.session.request('/v5/modules', {
+                'product_id':self.product,'game_type':payload['game_type'],'game_os':'win',**self.session.device})
+            data['modules']=extra.get('modules') or []
         if not data.get('file_list_url') or not data.get('sign'): raise DmmError('服务器未提供可用的标准下载清单')
         return data
 
@@ -268,6 +273,68 @@ class GameService:
         """
         self.progress('改用标准下载清单接口获取安装信息')
         return self.session.request('/v5/r2/filelist/cl', payload)
+
+    def install_modules(self, info, root, previous=None):
+        """下载并运行游戏声明的运行库模块（VC++ 运行库 / DirectX 等）。
+
+        官方 Player 在下载流程里同样会下载这些模块并以管理员身份执行；同一版本的
+        模块已经装过就跳过，避免每次更新都弹安装器。返回 {模块路径: 版本} 记录。
+        """
+        modules=info.get('modules') or []
+        done=dict(previous or {})
+        for module in modules:
+            if not isinstance(module,dict): continue
+            domain=module.get('domain'); remote=module.get('module_file_url')
+            folder=module.get('dir_name'); name=module.get('exec_file_name')
+            version=str(module.get('module_version') or '')
+            if not all(isinstance(value,str) and value for value in (domain,remote,folder,name)): continue
+            if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,120}',folder) or not re.fullmatch(r'[A-Za-z0-9_.\-]{1,120}',name):
+                raise DmmError('运行库模块路径无效')
+            key=f'{folder}/{name}'
+            target=root/folder/name
+            if done.get(key)==version and target.is_file(): continue
+            url=dmm_url(urljoin(domain.rstrip('/')+'/',remote.lstrip('/')))
+            self.progress(f'下载运行库 {name}（{folder}）')
+            self._download_module(url,target,module.get('sign') or '')
+            self._run_module(target)
+            done[key]=version
+        return done
+
+    def _download_module(self, url, target, sign):
+        target.parent.mkdir(parents=True,exist_ok=True)
+        headers={'Cookie':sign} if sign else {}
+        attempts=getattr(self.session.http,'proxy_attempts',3)
+        for attempt in range(attempts):
+            self.session.cancel_check()
+            try:
+                with self.session.http.get(url,headers=headers,stream=True,timeout=(10,180),
+                                           allow_redirects=False) as response:
+                    if response.status_code!=200:
+                        raise DmmError(f'运行库下载失败：HTTP {response.status_code}')
+                    temporary=target.with_name(target.name+'.part')
+                    with temporary.open('wb') as output:
+                        for block in response.iter_content(256*1024):
+                            self.session.cancel_check()
+                            if block: output.write(block)
+                        output.flush(); os.fsync(output.fileno())
+                    os.replace(temporary,target)
+                    return
+            except requests.RequestException:
+                failover=getattr(self.session.http,'proxy_failover',None)
+                if failover is not None: failover()
+                if attempt==attempts-1:
+                    raise DmmError('运行库下载连接中断，请重新点安装继续') from None
+
+    def _run_module(self, target):
+        """按官方做法以管理员身份运行模块；需要提权时交给系统弹 UAC。"""
+        if target.suffix.lower()!='.exe' or not target.is_file():
+            raise DmmError('运行库模块不是可执行文件，已跳过')
+        self.progress(f'安装运行库 {target.name}（可能弹出 UAC，请允许）')
+        try:
+            subprocess.run([str(target)],cwd=str(target.parent),check=False)
+        except OSError:
+            # 安装包要求管理员权限时 CreateProcess 会失败，改由系统弹 UAC 启动。
+            ctypes.windll.shell32.ShellExecuteW(None,'runas',str(target),None,str(target.parent),1)
 
     def remote_info(self):
         """gameinfo 查询：最新版本与大小，未安装的游戏也可用（不触发 308 下载限制）。"""
@@ -351,7 +418,9 @@ class GameService:
         self.stopped(root)
         updater.run()
         if plan.pending(): raise DmmError('文件校验未通过')
-        value=records(); value[self.product]={'root':str(root),'version':info['latest_version'],'title':self.title}
+        modules=self.install_modules(info,root,(saved or {}).get('modules'))
+        value=records(); value[self.product]={'root':str(root),'version':info['latest_version'],
+                                              'title':self.title,'modules':modules}
         atomic_write(data_dir()/'games.json',json.dumps(value,ensure_ascii=False).encode())
         if action!='launch': return f"{self.title} {info['latest_version']} 安装 / 更新并校验完成"
         self.session.cancel_check()

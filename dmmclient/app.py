@@ -417,7 +417,7 @@ class Window(QMainWindow):
         head.addWidget(self.filter_box)
         self.button(head, '刷新游戏列表', 'refresh-catalog')
         box.addLayout(head)
-        hint = QLabel('免官方 Player 全新安装；仅支持标准下载型游戏，需要专用安装程序 / 模块 / DRM 的会明确拒绝。Fanza 游戏需年龄认证账号，与一般版版本各自独立。')
+        hint = QLabel('免官方 Player 全新安装；仅支持标准下载型游戏，需要专用安装程序或 DRM 的会明确拒绝。个别游戏要先装 VC++ / DirectX 运行库，客户端会自动下载并运行（可能弹 UAC）。Fanza 游戏需年龄认证账号，与一般版版本各自独立。')
         hint.setObjectName('muted'); hint.setWordWrap(True); box.addWidget(hint)
         self.store_grid = game_grid(); box.addWidget(self.store_grid, 1)
         self.search.textChanged.connect(lambda _: self.repopulate_store())
