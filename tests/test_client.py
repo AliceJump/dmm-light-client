@@ -95,4 +95,32 @@ class ClientTests(unittest.TestCase):
         grid.deleteLater(); app.processEvents()
 
 
+    def test_refresh_keeps_card_wall_scroll_position(self):
+        """安装完成后的刷新不应把卡片墙弹回顶部（clear() 会把滚动条归零）。"""
+        import json
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None):
+            games = [{'product': f'game{i:02d}', 'title': f'Game {i}', 'adult': False,
+                      'image_url': '', 'genre': '', 'maker': '', 'link': ''} for i in range(60)]
+            data_dir().mkdir(parents=True, exist_ok=True)
+            (data_dir() / 'catalog.json').write_text(json.dumps(games), encoding='utf-8')
+            window = Window()
+            window.show(); window.tabs.setCurrentIndex(1)
+            for _ in range(10): app.processEvents()
+            bar = window.store_grid.verticalScrollBar()
+            self.assertGreater(bar.maximum(), 500)
+            bar.setValue(500)
+            for _ in range(3): app.processEvents()
+            window.refresh()
+            for _ in range(8): app.processEvents()
+            self.assertEqual(bar.value(), 500, '刷新后应停在原位置')
+            window.search.setText('Game 1')
+            for _ in range(8): app.processEvents()
+            self.assertEqual(bar.value(), 0, '搜索应回到顶部')
+            window.close(); window.deleteLater(); app.processEvents()
+
+
 if __name__ == '__main__': unittest.main()

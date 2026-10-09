@@ -506,7 +506,20 @@ class Window(QMainWindow):
         titles.update({product: value.get('title', product) for product, value in records().items()})
         return titles
 
-    def repopulate_library(self):
+    @staticmethod
+    def _restore_scroll(grid, offset):
+        """重建卡片墙后恢复滚动位置：QListWidget.clear() 会把滚动条归零。
+
+        必须先把新条目的布局算出来（doItemsLayout），否则滚动范围仍是 0，
+        setValue 会被夹到顶部。
+        """
+        if not offset:
+            return
+        grid.doItemsLayout()
+        grid.verticalScrollBar().setValue(min(offset, grid.verticalScrollBar().maximum()))
+
+    def repopulate_library(self, keep_scroll=True):
+        offset = self.library_grid.verticalScrollBar().value() if keep_scroll else 0
         self.library_grid.clear(); self.library_buttons = []; self.library_covers = {}
         installed = {**official_records(), **records()}
         try:
@@ -527,8 +540,10 @@ class Window(QMainWindow):
                 self.library_covers, product, title,
                 f"{origin}已安装 · 版本 {value.get('version', '未知')}",
                 [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False)]))
+        self._restore_scroll(self.library_grid, offset)
 
-    def repopulate_store(self):
+    def repopulate_store(self, keep_scroll=False):
+        offset = self.store_grid.verticalScrollBar().value() if keep_scroll else 0
         self.store_grid.clear(); self.store_buttons = []; self.store_covers = {}
         installed = {**official_records(), **records()}
         titles = self.known_titles()
@@ -550,12 +565,13 @@ class Window(QMainWindow):
                 state, buttons = badge + '未安装 · 可全新安装', [('全新安装', 'game-update', True), ('详情', 'detail-open', False)]
             self.add_card(self.store_grid, self.make_card(self.store_grid, self.store_buttons,
                 self.store_covers, product, title, state, buttons))
+        self._restore_scroll(self.store_grid, offset)
 
     # ---------- 刷新与封面 ----------
 
     def refresh(self):
         try:
-            self.repopulate_library(); self.repopulate_store()
+            self.repopulate_library(True); self.repopulate_store(True)
             value = AccountStore(data_dir()).read()
             self.accounts.clear()
             for account in value['accounts']:
