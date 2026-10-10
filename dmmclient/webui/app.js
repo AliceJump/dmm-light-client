@@ -4,7 +4,6 @@
 let bridge = null;
 let state = null;              // 最近一次快照
 let detail = null;             // 当前详情 {product,...}
-let detailOpen = false;
 let filterMode = 0;
 let query = '';
 let coverBase = {};            // product -> 封面 URI（文件可能还没下载，先记住地址）
@@ -50,8 +49,8 @@ function applySnapshot(data) {
   renderStore();
   renderAccount(data.account);
   renderNetwork(data.network);
-  if (!detailOpen) $('detail-view').classList.add('hidden');
   $('pause').disabled = !data.busy;
+  if (currentPage === 'gamelib') renderGameLib();   // 安装状态可能变了
 }
 
 function buttonHtml(b, product) {
@@ -240,30 +239,42 @@ function renderNetwork(n) {
   });
 }
 
-/* ---------- 详情视图 ---------- */
+/* ---------- 详情视图（独立的「游戏库」页：左侧全部游戏可筛选，右侧详情） ---------- */
+let listFilter = 'all';
+let prevPage = 'lib';
+
+function listRows() {
+  if (!state) return [];
+  const installed = new Set(state.installedProducts || []);
+  return state.store.map(c => ({
+    product: c.product, title: c.title, cover: c.coverBase || c.cover || '',
+    meta: installed.has(c.product) ? '已安装' : '未安装'
+  })).filter(r =>
+    listFilter === 'all' || (listFilter === 'installed') === (r.meta === '已安装'));
+}
+
+function renderGameLib() {
+  patchGamelist($('gamelist'), listRows(), detail ? detail.product : '');
+  if (!detail) {
+    renderIfChanged('pane', 'empty', () => {
+      $('gamedetail').innerHTML = '<p class="muted">从左侧选择一款游戏查看详情</p>';
+    });
+    return;
+  }
+  const d = detail;
+  patchGamelist($('gamelist'), listRows(), d.product);
+  const sig = JSON.stringify([d.product, d.title, d.stateLine, d.root, d.buttons, d.shots,
+    d.description, d.info, d.specs, d.captions, d.links, d.loading, d.coverBase]);
+  renderIfChanged('pane', sig, () => { $('gamedetail').outerHTML = paneHtml(d); });
+}
+
 function applyDetail(data) {
   if (!data.product) return;
-  const sameProduct = detail && detail.product === data.product;
   detail = data;
   coverBase[data.product] = data.coverBase || coverBase[data.product];
   if (!data.open) return;                    // 只是缓存数据，不开视图
-  const wasOpen = detailOpen;
-  detailOpen = true;
-  showPage('lib');                           // 详情视图在车库页里，人在发现页点详情要先切过去
-  $('lib-view').classList.add('hidden');
-  $('detail-view').classList.remove('hidden');
-  if (wasOpen && sameProduct && document.querySelector('.detail-wrap')) {
-    patchGamelist($('gamelist'), data.list || [], data.product);   // 左侧列表原地复用
-    const paneSig = JSON.stringify([data.stateLine, data.root, data.buttons,
-      data.shots, data.description, data.info, data.specs, data.captions, data.links, data.loading]);
-    renderIfChanged('pane:' + data.product, paneSig, () => {
-      document.querySelector('.detail-wrap .pane').outerHTML = paneHtml(data);
-    });
-  } else {
-    sigs['pane:' + data.product] = null;
-    renderDetail();                          // 换游戏才整体重画
-    $('scroll').scrollTop = 0;
-  }
+  renderGameLib();
+  if (currentPage !== 'gamelib') showPage('gamelib');
 }
 
 function rowHtml(r, active) {
@@ -295,7 +306,7 @@ function patchGamelist(container, rows, current) {
 }
 
 function paneHtml(d) {
-  return `<div class="pane">
+  return `<div class="pane" id="gamedetail">
       <div class="block"><div class="detail-head">
         ${d.cover ? `<img class="big" src="${esc(d.cover)}">` : ''}
         <div class="col">
@@ -319,17 +330,6 @@ function paneHtml(d) {
       ${d.loading ? '<div class="loading">正在获取商店信息（简介 / 截图 / 运行环境）…</div>' : ''}
       <p class="note">${esc(d.note || '')}</p>
     </div>`;
-}
-
-function renderDetail() {
-  const d = detail; if (!d) return;
-  const rows = d.list || [];
-  $('detail-view').innerHTML = `<div class="detail-wrap">
-    <div>
-      <button class="btn" data-act="__close_detail" style="margin-bottom:10px">← 返回车库</button>
-      <div class="gamelist" id="gamelist">${rows.map(r => rowHtml(r, r.product === d.product)).join('')}</div>
-    </div>
-    ${paneHtml(d)}</div>`;
 }
 
 /* ---------- 状态 ---------- */
@@ -387,7 +387,7 @@ document.addEventListener('click', ev => {
   const btn = ev.target.closest('[data-act]');
   if (btn) {
     const act = btn.dataset.act;
-    if (act === '__close_detail') { closeDetail(); return; }
+    if (act === '__close_detail') { showPage(prevPage === 'gamelib' ? 'lib' : prevPage); return; }
     if (act === 'switch-account') {
       const sel = $('accountsel');
       call(act, {number: sel ? sel.value : ''}); return;
@@ -409,29 +409,30 @@ document.addEventListener('click', ev => {
   if (cardEl && !btn) { call('open-detail', {product: cardEl.dataset.detail}); return; }
 });
 
-function closeDetail() {
-  detailOpen = false; detail = null;
-  $('detail-view').classList.add('hidden');
-  $('lib-view').classList.remove('hidden');
-}
-
 /* 顶栏 */
-const TITLES = {lib: ['我的车库', '已安装的游戏'], store: ['发现游戏', '可安装的游戏'],
+const TITLES = {lib: ['我的车库', '已安装的游戏'], gamelib: ['游戏库', '全部游戏 · 点选查看详情'],
+                store: ['发现游戏', '可安装的游戏'],
                 account: ['账号', '登录态与账号快照'], network: ['网络', '代理与节点']};
 let currentPage = 'lib';
 function showPage(page) {
+  if (page !== currentPage) prevPage = currentPage;
   currentPage = page;
   document.querySelectorAll('.nav a').forEach(x => x.classList.toggle('on', x.dataset.page === page));
-  ['lib', 'store', 'account', 'network'].forEach(p =>
+  ['lib', 'gamelib', 'store', 'account', 'network'].forEach(p =>
     $('page-' + p).classList.toggle('hidden', p !== page));
   $('searchbox').classList.toggle('hidden', page !== 'store');
   $('refresh').textContent = page === 'store' ? '刷新游戏列表' : '刷新';
   $('page-title').textContent = TITLES[page][0];
   $('page-sub').textContent = TITLES[page][1];
-  if (page === 'lib' && detailOpen) { $('detail-view').classList.remove('hidden'); $('lib-view').classList.add('hidden'); }
+  if (page === 'gamelib') renderGameLib();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = () => showPage(a.dataset.page));
 $('refresh').onclick = () => call(currentPage === 'store' ? 'refresh-catalog' : 'refresh');
+document.querySelectorAll('#gamelist-filters [data-lf]').forEach(b => b.onclick = () => {
+  listFilter = b.dataset.lf;
+  document.querySelectorAll('#gamelist-filters [data-lf]').forEach(x => x.classList.toggle('on', x === b));
+  renderGameLib();
+});
 $('search').addEventListener('input', e => { query = e.target.value.trim().toLowerCase(); renderStore(); });
 $('pause').onclick = () => call('cancel');
 $('logbtn').onclick = () => $('logbox').classList.toggle('hidden');

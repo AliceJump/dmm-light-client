@@ -11,6 +11,7 @@
     <div class="brand"><div class="mark">D</div><div><b>DMM Light</b><span>独立客户端</span></div></div>
     <nav class="nav">
       <a class="on" data-page="lib"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>我的车库<span class="count" id="libcount"></span></a>
+      <a data-page="gamelib"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>游戏库</a>
       <a data-page="store"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>发现游戏<span class="count" id="storecount"></span></a>
       <a data-page="account"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>账号</a>
       <a data-page="network"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>网络</a>
@@ -35,12 +36,23 @@
       <!-- 车库 -->
       <section id="page-lib">
         <div id="hero"></div>
-        <div id="lib-view">
-          <div class="sec"><h4>全部游戏</h4><span class="n" id="lib-count"></span>
-            <span class="hint">点卡片看详情</span></div>
-          <div class="grid" id="lib-grid"></div>
+        <div class="sec"><h4>全部游戏</h4><span class="n" id="lib-count"></span>
+          <span class="hint">点卡片看详情</span></div>
+        <div class="grid" id="lib-grid"></div>
+      </section>
+      <!-- 游戏库：全部游戏的主从详情 -->
+      <section id="page-gamelib" class="hidden">
+        <div class="detail-wrap">
+          <div>
+            <div class="filters" id="gamelist-filters" style="margin-bottom:10px">
+              <button class="on" data-lf="all">全部</button>
+              <button data-lf="installed">已安装</button>
+              <button data-lf="uninstalled">未安装</button>
+            </div>
+            <div class="gamelist" id="gamelist"></div>
+          </div>
+          <div class="pane" id="gamedetail"></div>
         </div>
-        <div id="detail-view" class="hidden"></div>
       </section>
       <!-- 发现 -->
       <section id="page-store" class="hidden">
