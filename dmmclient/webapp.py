@@ -40,6 +40,12 @@ def cover_uri(product):
     return path.as_uri() if path and path.is_file() else ''
 
 
+def cover_base(product):
+    """封面规范地址：文件还没下载也先给前端（covers 事件到达后按它补图）。"""
+    path = cover_path(data_dir(), product) if product else None
+    return path.as_uri() if path else ''
+
+
 def uri_of(path):
     return Path(path).as_uri() if path else ''
 
@@ -177,7 +183,7 @@ class WebWindow(QMainWindow):
             state = '未识别官方安装记录'
         cards = [{'product': 'gakumas', 'title': '学园偶像大师', 'state': state,
                   'badges': self.card_badges(state), 'cover': cover_uri('gakumas'),
-                  'coverBase': cover_uri('gakumas'),
+                  'coverBase': cover_base('gakumas'),
                   'buttons': [{'t': '启动', 'a': 'launch', 'pri': True},
                               {'t': '检查', 'a': 'check'}, {'t': '更新', 'a': 'update'},
                               {'t': '选择游戏目录', 'a': 'game-folder'}]}]
@@ -193,7 +199,7 @@ class WebWindow(QMainWindow):
             state = f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}"
             cards.append({'product': product, 'title': titles.get(product, product), 'state': state,
                           'badges': self.card_badges(state), 'cover': cover_uri(product),
-                          'coverBase': cover_uri(product), 'buttons': buttons})
+                          'coverBase': cover_base(product), 'buttons': buttons})
         return cards
 
     def store_cards(self):
@@ -218,7 +224,7 @@ class WebWindow(QMainWindow):
                            {'t': '目录', 'a': 'game-dir'}, {'t': '详情', 'a': 'detail-open'}]
             cards.append({'product': product, 'title': title, 'state': state, 'adult': product in adult,
                           'badges': self.card_badges(state), 'cover': cover_uri(product),
-                          'coverBase': cover_uri(product), 'buttons': buttons})
+                          'coverBase': cover_base(product), 'buttons': buttons})
         return cards
 
     def hero_data(self):
@@ -236,7 +242,7 @@ class WebWindow(QMainWindow):
                     {'t': '打开目录', 'a': 'game-dir'}])
         return {'product': product, 'title': self.known_titles().get(product, product),
                 'meta': f"已安装 · 版本 {version}{self.version_note(product)}",
-                'cover': cover_uri(product), 'coverBase': cover_uri(product), 'buttons': buttons}
+                'cover': cover_uri(product), 'coverBase': cover_base(product), 'buttons': buttons}
 
     def account_data(self):
         value = AccountStore(data_dir()).read()
@@ -316,7 +322,7 @@ class WebWindow(QMainWindow):
             note = '「全新安装」直接从 DMM CDN 下载到本客户端目录，不需要官方 Player。'
         self.send(type='detail', product=product, open=open_view,
                   title=self.known_titles().get(product, product), cover=cover_uri(product),
-                  coverBase=cover_uri(product),
+                  coverBase=cover_base(product),
                   chips=[str(c) for c in (entry.get('genre'), entry.get('maker')) if c]
                         + (['FANZA R18'] if entry.get('adult') else []) if (entry.get('genre') or entry.get('maker') or entry.get('adult')) else [],
                   stateLine=state_line, root=str(record.get('root', '')) if record else '',

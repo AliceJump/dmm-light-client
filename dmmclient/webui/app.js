@@ -7,6 +7,7 @@ let detail = null;             // 当前详情 {product,...}
 let detailOpen = false;
 let filterMode = 0;
 let query = '';
+let coverBase = {};            // product -> 封面 URI（文件可能还没下载，先记住地址）
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -34,6 +35,9 @@ function call(action, payload) {
 /* ---------- 快照渲染 ---------- */
 function applySnapshot(data) {
   state = data;
+  coverBase = {};
+  [...data.library, ...data.store].forEach(c => { coverBase[c.product] = c.coverBase; });
+  if (data.hero) coverBase[data.hero.product] = data.hero.coverBase;
   document.documentElement.dataset.theme = data.theme;
   $('libcount').textContent = data.library.length ? data.library.length + '' : '';
   $('storecount').textContent = data.store.length ? data.store.length + '' : '';
@@ -74,10 +78,43 @@ function cardHtml(card) {
     </div></article>`;
 }
 
+/* ---------- 增量更新：按 key 复用 DOM 节点，图片不重建就不闪 ---------- */
+const sigs = {};   // region -> 上次内容签名，没变化就完全不碰 DOM
+
+function patchGrid(container, cards) {
+  const existing = new Map([...container.querySelectorAll(':scope > .card')]
+    .map(el => [el.dataset.detail, el]));
+  const seen = new Set();
+  cards.forEach(card => {
+    const sig = JSON.stringify([card.title, card.state, card.buttons, !!card.cover]);
+    let el = existing.get(card.product);
+    if (el && el.dataset.sig === sig) {          // 内容没变：只调整位置，img 原地保留
+      container.appendChild(el);
+    } else {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = cardHtml(card).trim();
+      const node = tpl.content.firstElementChild;
+      node.dataset.sig = sig;
+      if (el) el.replaceWith(node); else container.appendChild(node);
+    }
+    seen.add(card.product);
+  });
+  existing.forEach((el, product) => { if (!seen.has(product)) el.remove(); });
+}
+
+function renderIfChanged(key, sig, render) {
+  if (sigs[key] === sig) return false;
+  sigs[key] = sig;
+  render();
+  return true;
+}
+
 function renderHero(hero) {
-  const el = $('hero');
-  if (!hero) { el.innerHTML = ''; return; }
-  el.innerHTML = `<div class="hero">
+  const sig = hero ? JSON.stringify([hero.product, hero.title, hero.meta, hero.buttons, hero.coverBase]) : 'none';
+  renderIfChanged('hero', sig, () => {
+    const el = $('hero');
+    if (!hero) { el.innerHTML = ''; return; }
+    el.innerHTML = `<div class="hero">
     ${hero.cover ? `<div class="bg" style="background-image:url('${esc(hero.cover)}')"></div>` : ''}
     <div class="veil"></div>
     <div class="body">
@@ -89,21 +126,18 @@ function renderHero(hero) {
         <div class="acts">${hero.buttons.map(b => buttonHtml(b, hero.product)).join('')}</div>
       </div>
     </div></div>`;
+  });
 }
 
 function renderLibrary(cards) {
-  const view = $('lib-view');
-  view.innerHTML = `<div class="sec"><h4>全部游戏</h4><span class="n">${cards.length} 款</span>
-      <span class="hint">点卡片看详情</span></div>
-    <div class="grid">${cards.map(cardHtml).join('')}</div>`;
+  $('lib-count').textContent = cards.length + ' 款';
+  patchGrid($('lib-grid'), cards);
 }
 
 function renderStore() {
   if (!state) return;
-  const modes = ['全部游戏', '一般游戏', 'Fanza R18', '已安装'];
-  $('filters').innerHTML = modes.map((m, i) =>
-    `<button class="${i === filterMode ? 'on' : ''}" data-filter="${i}">${m}</button>`).join('')
-    + `<span class="n" id="store-count2">${0} 款</span>`;
+  document.querySelectorAll('#filters [data-filter]').forEach(btn =>
+    btn.classList.toggle('on', +btn.dataset.filter === filterMode));
   const installed = new Set(state.installedProducts);
   const cards = state.store.filter(c => {
     if (query && !c.title.toLowerCase().includes(query)) return false;
@@ -112,13 +146,15 @@ function renderStore() {
     if (filterMode === 3 && !installed.has(c.product)) return false;
     return true;
   });
-  const n = $('store-count2'); if (n) n.textContent = `${cards.length} 款`;
-  $('store-grid').innerHTML = cards.map(cardHtml).join('');
+  $('store-count2').textContent = `${cards.length} 款`;
+  patchGrid($('store-grid'), cards);
 }
 
-/* ---------- 表单页 ---------- */
+/* ---------- 表单页（签名没变化就完全不碰 DOM，避免打断正在输入的内容） ---------- */
 function renderAccount(a) {
-  $('page-account').innerHTML = `<div class="cards2">
+  const sig = JSON.stringify(a);
+  renderIfChanged('account', sig, () => {
+    $('page-account').innerHTML = `<div class="cards2">
     <div class="panel">
       <h4>当前登录</h4>
       <p class="muted">${esc(a.state)}</p>
@@ -144,10 +180,13 @@ function renderAccount(a) {
     </div>
     <div class="panel wide"><h4>本地存储</h4><p class="muted">${esc(a.storage)}</p></div>
   </div>`;
+  });
 }
 
 function renderNetwork(n) {
-  $('page-network').innerHTML = `<div class="cards2">
+  const sig = JSON.stringify(n);
+  renderIfChanged('network', sig, () => {
+    $('page-network').innerHTML = `<div class="cards2">
     <div class="panel">
       <h4>代理</h4>
       <label class="flabel">代理来源</label>
@@ -183,33 +222,64 @@ function renderNetwork(n) {
     </div>
     <div class="panel wide"><h4>当前状态</h4><p class="muted">${esc(n.state)}</p></div>
   </div>`;
+  });
 }
 
 /* ---------- 详情视图 ---------- */
 function applyDetail(data) {
   if (!data.product) return;
+  const sameProduct = detail && detail.product === data.product;
   detail = data;
+  coverBase[data.product] = data.coverBase || coverBase[data.product];
   if (!data.open) return;                    // 只是缓存数据，不开视图
+  const wasOpen = detailOpen;
   detailOpen = true;
   $('lib-view').classList.add('hidden');
   $('detail-view').classList.remove('hidden');
-  renderDetail();
-  $('scroll').scrollTop = 0;
+  if (wasOpen && sameProduct && document.querySelector('.detail-wrap')) {
+    patchGamelist($('gamelist'), data.list || [], data.product);   // 左侧列表原地复用
+    const paneSig = JSON.stringify([data.stateLine, data.root, data.buttons,
+      data.shots, data.description, data.info, data.specs, data.captions, data.links, data.loading]);
+    renderIfChanged('pane:' + data.product, paneSig, () => {
+      document.querySelector('.detail-wrap .pane').outerHTML = paneHtml(data);
+    });
+  } else {
+    sigs['pane:' + data.product] = null;
+    renderDetail();                          // 换游戏才整体重画
+    $('scroll').scrollTop = 0;
+  }
 }
 
-function renderDetail() {
-  const d = detail; if (!d) return;
-  const rows = d.list || [];
-  $('detail-view').innerHTML = `<div class="detail-wrap">
-    <div>
-      <button class="btn" data-act="__close_detail" style="margin-bottom:10px">← 返回车库</button>
-      <div class="gamelist">${rows.map(r => `
-        <div class="row ${r.product === d.product ? 'on' : ''}" data-row="${esc(r.product)}">
-          ${r.cover ? `<img src="${esc(r.cover)}">` : '<img>'}
-          <div><div class="t">${esc(r.title)}</div><div class="m">${esc(r.meta)}</div></div>
-        </div>`).join('')}</div>
-    </div>
-    <div class="pane">
+function rowHtml(r, active) {
+  return `<div class="row ${active ? 'on' : ''}" data-row="${esc(r.product)}">
+    ${r.cover ? `<img src="${esc(r.cover)}">` : '<img>'}
+    <div><div class="t">${esc(r.title)}</div><div class="m">${esc(r.meta)}</div></div>
+  </div>`;
+}
+
+function patchGamelist(container, rows, current) {
+  const existing = new Map([...container.querySelectorAll(':scope > .row')]
+    .map(el => [el.dataset.row, el]));
+  const seen = new Set();
+  rows.forEach(r => {
+    const sig = JSON.stringify([r.title, r.meta, !!r.cover, r.product === current]);
+    let el = existing.get(r.product);
+    if (el && el.dataset.sig === sig) {
+      container.appendChild(el);
+    } else {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = rowHtml(r, r.product === current).trim();
+      const node = tpl.content.firstElementChild;
+      node.dataset.sig = sig;
+      if (el) el.replaceWith(node); else container.appendChild(node);
+    }
+    seen.add(r.product);
+  });
+  existing.forEach((el, product) => { if (!seen.has(product)) el.remove(); });
+}
+
+function paneHtml(d) {
+  return `<div class="pane">
       <div class="block"><div class="detail-head">
         ${d.cover ? `<img class="big" src="${esc(d.cover)}">` : ''}
         <div class="col">
@@ -232,7 +302,18 @@ function renderDetail() {
         `<button class="btn" data-url="${esc(l.url)}">${esc(l.text || '打开')}</button>`).join('')}</div></div>` : ''}
       ${d.loading ? '<div class="loading">正在获取商店信息（简介 / 截图 / 运行环境）…</div>' : ''}
       <p class="note">${esc(d.note || '')}</p>
-    </div></div>`;
+    </div>`;
+}
+
+function renderDetail() {
+  const d = detail; if (!d) return;
+  const rows = d.list || [];
+  $('detail-view').innerHTML = `<div class="detail-wrap">
+    <div>
+      <button class="btn" data-act="__close_detail" style="margin-bottom:10px">← 返回车库</button>
+      <div class="gamelist" id="gamelist">${rows.map(r => rowHtml(r, r.product === d.product)).join('')}</div>
+    </div>
+    ${paneHtml(d)}</div>`;
 }
 
 /* ---------- 状态 ---------- */
@@ -246,18 +327,36 @@ function setProgress(p) {
   if (p.text) $('status').textContent = p.text;
 }
 
-/* 封面后台补齐后只换图片，不整页重绘 */
+/* 封面后台补齐后只换图片地址：已有 <img> 的原地换 src，占位卡片单独重建 */
 function refreshCovers(products) {
   if (!state) return;
   const stamp = Date.now();
+  const set = new Set(products);
+  const fresh = p => coverBase[p] ? coverBase[p] + '?t=' + stamp : '';
   const patch = cards => cards.forEach(c => {
-    if (products.includes(c.product)) c.cover = c.coverBase + '?t=' + stamp;
+    if (set.has(c.product) && coverBase[c.product]) c.cover = fresh(c.product);
   });
   patch(state.library); patch(state.store);
   renderLibrary(state.library); renderStore();
-  if (detail && products.includes(detail.product)) { detail.cover = detail.coverBase + '?t=' + stamp; renderDetail(); }
-  if (state.hero && products.includes(state.hero.product)) { state.hero.cover = state.hero.coverBase + '?t=' + stamp; renderHero(state.hero); }
-  document.querySelectorAll('img').forEach(img => { if (img.src.startsWith('file:')) img.src += ''; });
+  if (state.hero && set.has(state.hero.product) && coverBase[state.hero.product]) {
+    state.hero.cover = fresh(state.hero.product);
+    const heroEl = document.querySelector('#hero .hero');       // hero 原地换图，不重建
+    const thumb = heroEl && heroEl.querySelector('img.thumb');
+    if (thumb) {
+      thumb.src = fresh(state.hero.product);
+      const bg = heroEl.querySelector('.bg');
+      if (bg) bg.style.backgroundImage = `url('${fresh(state.hero.product)}')`;
+    } else {
+      sigs['hero'] = null; renderHero(state.hero);              // 之前没有封面图，只能重建一次
+    }
+  }
+  if (detail && set.has(detail.product) && coverBase[detail.product]) {
+    detail.cover = fresh(detail.product);
+    const big = document.querySelector('.detail-head img.big');
+    if (big) big.src = fresh(detail.product);
+    document.querySelectorAll(`.gamelist .row[data-row="${CSS.escape(detail.product)}"] img`)
+      .forEach(img => { img.src = fresh(detail.product); });
+  }
 }
 
 /* ---------- 全局事件委托 ---------- */

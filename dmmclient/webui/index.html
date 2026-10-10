@@ -35,13 +35,23 @@
       <!-- 车库 -->
       <section id="page-lib">
         <div id="hero"></div>
-        <div id="lib-view"></div>
+        <div id="lib-view">
+          <div class="sec"><h4>全部游戏</h4><span class="n" id="lib-count"></span>
+            <span class="hint">点卡片看详情</span></div>
+          <div class="grid" id="lib-grid"></div>
+        </div>
         <div id="detail-view" class="hidden"></div>
       </section>
       <!-- 发现 -->
       <section id="page-store" class="hidden">
-        <div class="filters" id="filters"></div>
-        <div class="sec"><h4 id="store-sec-title">全部游戏</h4><span class="n" id="store-count2"></span></div>
+        <div class="filters" id="filters">
+          <button class="on" data-filter="0">全部游戏</button>
+          <button data-filter="1">一般游戏</button>
+          <button data-filter="2">Fanza R18</button>
+          <button data-filter="3">已安装</button>
+          <span class="n" id="store-count2"></span>
+        </div>
+        <div class="sec"><h4 id="store-sec-title">全部游戏</h4></div>
         <div class="grid" id="store-grid"></div>
       </section>
       <!-- 账号 -->
