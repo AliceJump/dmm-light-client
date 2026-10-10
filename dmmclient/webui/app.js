@@ -322,7 +322,8 @@ function paneHtml(d) {
         </div></div>
         <div class="links-row" style="margin-top:14px">${(d.buttons || []).map(b => buttonHtml(b, d.product)).join('')}</div>
       </div>
-      ${(d.shots && d.shots.length) ? `<div class="block"><h4>截图</h4><div class="shots">${d.shots.map(s => `<img loading="lazy" src="${esc(s)}">`).join('')}</div></div>` : ''}
+      ${(d.shots && d.shots.length) ? `<div class="block"><h4>截图</h4><div class="shots">${d.shots.map(s =>
+        `<img loading="lazy" src="${esc(s.t || s)}" data-full="${esc(s.f || s.t || s)}">`).join('')}</div></div>` : ''}
       ${d.description ? `<div class="block"><h4>简介</h4><div class="desc">${esc(d.description)}</div></div>` : ''}
       ${(d.info && d.info.length) ? `<div class="block"><h4>游戏信息</h4><div class="specgrid">${d.info.map(i =>
         `<span class="k">${esc(i.key)}</span><span class="v" style="user-select:text">${esc(i.value)}</span>`).join('')}</div></div>` : ''}
@@ -455,7 +456,7 @@ const lightbox = $('lightbox');
 document.addEventListener('click', ev => {
   const shot = ev.target.closest('.pane .shots img');
   if (shot) {
-    lightbox.querySelector('img').src = shot.currentSrc || shot.src;
+    lightbox.querySelector('img').src = shot.dataset.full || shot.currentSrc || shot.src;
     lightbox.classList.remove('hidden');
     return;
   }

@@ -21,11 +21,11 @@ from PySide6.QtWebChannel import QWebChannel   # noqa: E402
 # QWebEngineView 的导入会初始化 Chromium，必须等 bootstrap_proxy 写好
 # QTWEBENGINE_CHROMIUM_FLAGS 之后再导入 —— 延迟到 run_webview 里做。
 
-from .app import (AccountWorker, CoverWorker, DetailWorker, VersionWorker, Worker,
+from .app import (AccountWorker, CoverWorker, DetailWorker, ShotWorker, VersionWorker, Worker,
     app_icon, enable_system_proxy, log_error, restore_system_proxy, system_proxy_active)
 from .backend.accounts import AccountStore
 from .backend.games import (SUPPORTED, catalog, cover_path, installed_record, records,
-    official_records)
+    official_records, load_shot_pairs)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.session import DmmError, atomic_write, data_dir, valid_proxy
 from .backend.settings import (default_install_base, game_install_base, game_install_root,
@@ -124,6 +124,7 @@ class WebWindow(QMainWindow):
         self.detail_worker = None
         self.detail_loading = None
         self.detail_pending = None
+        self.shot_worker = None
         self.detail_data = {}
         self.detail_shots = {}
         self.cover_worker = None
@@ -336,7 +337,9 @@ class WebWindow(QMainWindow):
                   stateLine=state_line, root=str(record.get('root', '')) if record else '',
                   buttons=buttons,
                   list=[self.detail_row(p) for p in self.detail_products()],
-                  shots=[uri_of(p) for p in (self.detail_shots.get(product) or [])],
+                  shots=[{'t': uri_of(s.get('t')), 'f': uri_of(s.get('f') or s.get('t'))}
+                         for s in (self.detail_shots.get(product) or [])
+                         if isinstance(s, dict) and s.get('t')],
                   description=data.get('description', ''), info=data.get('info') or [],
                   specs=data.get('specs') or [], captions=data.get('captions') or [],
                   links=data.get('links') or [], loading=self.detail_loading == product and not data,
@@ -366,8 +369,9 @@ class WebWindow(QMainWindow):
         if cached.is_file():
             try:
                 self.detail_data[product] = json.loads(cached.read_text(encoding='utf-8'))
-                folder = data_dir() / 'shots'
-                self.detail_shots[product] = [str(p) for p in sorted(folder.glob(f'{product}-*.jpg'))]
+                self.detail_shots[product] = load_shot_pairs(product)
+                if any(pair['f'] == pair['t'] for pair in self.detail_shots[product]):
+                    self.kick_shot_upgrade(product)   # 老缓存没有大图，后台补抓
                 self.push_detail(product, True)
                 return
             except Exception:
@@ -389,6 +393,19 @@ class WebWindow(QMainWindow):
         if product == self.detail_product: self.push_detail(product, True)
         pending = self.detail_pending; self.detail_pending = None
         if pending and pending not in self.detail_data: self.kick_detail(pending)
+
+    def kick_shot_upgrade(self, product):
+        """老缓存只有缩略图：后台补抓大图，完成后刷新详情。"""
+        if self.shot_worker and self.shot_worker.isRunning(): return
+        images = (self.detail_data.get(product) or {}).get('images') or []
+        if not any(image.get('full') for image in images): return
+        self.shot_worker = ShotWorker(self.settings, product, images)
+        self.shot_worker.ready.connect(self.shots_ready)
+        self.shot_worker.start()
+
+    def shots_ready(self, product, shots):
+        if shots: self.detail_shots[product] = shots
+        if product == self.detail_product: self.push_detail(product, True)
 
     # ---------- 后台补齐 ----------
 

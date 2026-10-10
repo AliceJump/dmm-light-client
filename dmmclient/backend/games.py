@@ -364,6 +364,38 @@ def fetch_shot(http, url, target):
     return target
 
 
+def fetch_detail_shots(http, product, images, limit=8):
+    """下载详情截图：缩略图与大图分开缓存（列表用缩略图，灯箱放大用大图）。"""
+    folder = data_dir() / 'shots'
+    out = []
+    for index, image in enumerate(images[:limit]):
+        thumb = image.get('thumb')
+        full = image.get('full') or thumb
+        t_path = folder / f"{product}-{index}.jpg"
+        f_path = folder / f"{product}-{index}f.jpg"
+        try: fetch_shot(http, thumb or full, t_path)
+        except Exception: continue
+        if full and full != thumb:
+            try: fetch_shot(http, full, f_path)
+            except Exception: f_path = t_path
+        out.append({'t': str(t_path), 'f': str(f_path)})
+    return out
+
+
+def load_shot_pairs(product):
+    """把 shots 缓存目录里的截图重组为 [{'t': 缩略图, 'f': 大图}]（按编号排序）。"""
+    folder = data_dir() / 'shots'
+    pairs = {}
+    for path in folder.glob(f'{product}-*.jpg'):
+        name = path.stem[len(product)+1:]
+        if name.endswith('f') and len(name) > 1:
+            pairs.setdefault(name[:-1], {})['f'] = str(path)
+        else:
+            pairs.setdefault(name, {})['t'] = str(path)
+    return [{'t': pair['t'], 'f': pair.get('f') or pair['t']}
+            for _, pair in sorted(pairs.items()) if pair.get('t')]
+
+
 def uninstall_game(product, keep_files=False, progress=lambda done, total: None,
                    cancel_check=lambda: None, message=lambda text: None):
     """卸载本客户端安装的游戏；keep_files=True 时只移除安装记录，文件留着。

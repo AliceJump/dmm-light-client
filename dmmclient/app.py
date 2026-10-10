@@ -27,8 +27,8 @@ from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path, game_root,
     installed_record, move_game, official_record, official_records, record_version, records,
-    fetch_shot, refresh_catalog, save_cover, store_detail, uninstall_game,
-    verify_version)
+    fetch_shot, fetch_detail_shots, refresh_catalog, save_cover, store_detail, uninstall_game,
+    verify_version, load_shot_pairs)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
@@ -667,16 +667,32 @@ class DetailWorker(QThread):
                 session.ensure_login()
                 detail = store_detail(session, self.product, self.adult)
                 if detail:
-                    folder = data_dir() / 'shots'
-                    for index, image in enumerate((detail.get('images') or [])[:8]):
-                        target = folder / f"{self.product}-{index}.jpg"
-                        try: fetch_shot(session.http, image.get('thumb') or image.get('full'), target)
-                        except Exception: continue
-                        result['shots'].append(str(target))
+                    result['shots'] = fetch_detail_shots(
+                        session.http, self.product, detail.get('images') or [])
                     result['detail'] = detail
         except Exception:
             pass
         self.ready.emit(self.product, result)
+
+
+class ShotWorker(QThread):
+    """后台补抓截图大图：老缓存只有缩略图，灯箱放大需要清晰版。"""
+    ready = Signal(str, list)   # product, [{'t','f'}]
+
+    def __init__(self, settings, product, images, parent=None):
+        super().__init__(parent)
+        self.settings, self.product, self.images = dict(settings), product, list(images)
+
+    def run(self):
+        shots = []
+        try:
+            with operation_proxy(self.settings, lambda message: None, lambda: None, data_dir()) as proxy:
+                session = DmmSession(proxy)
+                session.ensure_login()
+                shots = fetch_detail_shots(session.http, self.product, self.images)
+        except Exception:
+            pass
+        self.ready.emit(self.product, shots)
 
 
 class DetailPane(QScrollArea):
@@ -1480,8 +1496,7 @@ class Window(QMainWindow):
         if cached.is_file():
             try:
                 self.detail_data[product] = json.loads(cached.read_text(encoding='utf-8'))
-                folder = data_dir() / 'shots'
-                self.detail_shots[product] = [str(path) for path in sorted(folder.glob(f'{product}-*.jpg'))]
+                self.detail_shots[product] = [pair['t'] for pair in load_shot_pairs(product)]
                 if product == getattr(self, 'detail_product', None): self.snap_fill(product)
                 return
             except Exception:
@@ -1499,7 +1514,7 @@ class Window(QMainWindow):
         # 丢掉最后一个引用会让 QThread 被 GC 掉（运行中被回收 = Qt abort）。
         self.detail_loading = None
         if payload.get('detail'): self.detail_data[product] = payload['detail']
-        if payload.get('shots'): self.detail_shots[product] = payload['shots']
+        if payload.get('shots'): self.detail_shots[product] = [pair['t'] for pair in payload['shots']]
         if product == getattr(self, 'detail_product', None): self.snap_fill(product)
         pending = self.detail_pending; self.detail_pending = None
         if pending and pending not in self.detail_data: self.kick_detail(pending)
