@@ -32,6 +32,14 @@ def default_install_base() -> Path:
     return data_dir() / 'games'
 
 
+def global_install_base(settings: dict | None = None) -> Path:
+    """默认游戏库：用户在设置里指定过就用它，否则用 data_dir()/games。"""
+    value = (settings if settings is not None else load_settings()).get('install_base')
+    if isinstance(value, str) and value.strip():
+        return Path(value).expanduser()
+    return default_install_base()
+
+
 def install_bases() -> dict:
     """每款游戏单独指定的安装基准目录（安装时选择或移动后记录）。"""
     value = load_settings().get('install_bases')

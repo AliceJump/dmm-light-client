@@ -221,6 +221,21 @@ function renderNetwork(n) {
 浏览器登录使用 HTTP 代理或内置节点池；SOCKS5 支持 API、更新和下载。</p>
     </div>
     <div class="panel wide"><h4>当前状态</h4><p class="muted">${esc(n.state)}</p></div>
+    <div class="panel wide">
+      <h4>游戏安装</h4>
+      <label class="flabel">默认游戏库（游戏会装到其下的 <product> 子目录）</label>
+      <div class="row" style="flex-wrap:nowrap;margin:4px 0 8px">
+        <input class="field" id="defaultbase" style="margin:0;flex:1" value="${esc(n.installBase)}"
+               placeholder="${esc(n.defaultBase)}">
+        <button class="btn" data-act="browse-base">浏览…</button>
+      </div>
+      <div class="switchline">
+        <input type="checkbox" id="askdir" ${n.askInstall ? 'checked' : ''}>
+        <label for="askdir">每次安装时询问安装位置</label>
+      </div>
+      <p class="muted">不勾选时全部游戏直接装到默认游戏库；某款游戏单独选过的位置优先于默认库。
+保存代理设置的按钮会一并保存这里的设置。</p>
+    </div>
   </div>`;
   });
 }
@@ -234,6 +249,7 @@ function applyDetail(data) {
   if (!data.open) return;                    // 只是缓存数据，不开视图
   const wasOpen = detailOpen;
   detailOpen = true;
+  showPage('lib');                           // 详情视图在车库页里，人在发现页点详情要先切过去
   $('lib-view').classList.add('hidden');
   $('detail-view').classList.remove('hidden');
   if (wasOpen && sameProduct && document.querySelector('.detail-wrap')) {
@@ -380,8 +396,10 @@ document.addEventListener('click', ev => {
       call(act, {number: $('number').value.trim(), name: $('accname').value.trim()}); return;
     }
     if (act === 'settings') {
-      call(act, {proxy: $('proxy').value.trim(), mode: $('mode').value === '0'});
-      $('status').textContent = '代理设置已保存'; return;
+      call(act, {proxy: $('proxy').value.trim(), mode: $('mode').value === '0',
+                 install_base: $('defaultbase') ? $('defaultbase').value.trim() : '',
+                 ask: $('askdir') ? $('askdir').checked : true});
+      return;
     }
     if (act === 'import-node') { call(act, {text: $('nodetext').value}); return; }
     if (act === 'new-account') { call(act, {number: $('number').value.trim(), name: $('accname').value.trim()}); return; }
@@ -400,9 +418,10 @@ function closeDetail() {
 /* 顶栏 */
 const TITLES = {lib: ['我的车库', '已安装的游戏'], store: ['发现游戏', '可安装的游戏'],
                 account: ['账号', '登录态与账号快照'], network: ['网络', '代理与节点']};
-document.querySelectorAll('.nav a').forEach(a => a.onclick = () => {
-  const page = a.dataset.page;
-  document.querySelectorAll('.nav a').forEach(x => x.classList.toggle('on', x === a));
+let currentPage = 'lib';
+function showPage(page) {
+  currentPage = page;
+  document.querySelectorAll('.nav a').forEach(x => x.classList.toggle('on', x.dataset.page === page));
   ['lib', 'store', 'account', 'network'].forEach(p =>
     $('page-' + p).classList.toggle('hidden', p !== page));
   $('searchbox').classList.toggle('hidden', page !== 'store');
@@ -410,8 +429,9 @@ document.querySelectorAll('.nav a').forEach(a => a.onclick = () => {
   $('page-title').textContent = TITLES[page][0];
   $('page-sub').textContent = TITLES[page][1];
   if (page === 'lib' && detailOpen) { $('detail-view').classList.remove('hidden'); $('lib-view').classList.add('hidden'); }
-});
-$('refresh').onclick = () => call($('page-store') && !$('page-store').classList.contains('hidden') ? 'refresh-catalog' : 'refresh');
+}
+document.querySelectorAll('.nav a').forEach(a => a.onclick = () => showPage(a.dataset.page));
+$('refresh').onclick = () => call(currentPage === 'store' ? 'refresh-catalog' : 'refresh');
 $('search').addEventListener('input', e => { query = e.target.value.trim().toLowerCase(); renderStore(); });
 $('pause').onclick = () => call('cancel');
 $('logbtn').onclick = () => $('logbox').classList.toggle('hidden');

@@ -14,7 +14,8 @@ from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QUrl, Signal, Slot
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox, QVBoxLayout
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QVBoxLayout)
 
 from PySide6.QtWebChannel import QWebChannel   # noqa: E402
 # QWebEngineView 的导入会初始化 Chromium，必须等 bootstrap_proxy 写好
@@ -27,8 +28,8 @@ from .backend.games import (SUPPORTED, catalog, cover_path, installed_record, re
     official_records)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.session import DmmError, atomic_write, data_dir, valid_proxy
-from .backend.settings import (game_install_base, game_install_root, install_bases,
-    load_settings, remember_install_base)
+from .backend.settings import (default_install_base, game_install_base, game_install_root,
+    global_install_base, install_bases, load_settings, remember_install_base, save_settings)
 from .backend.xray import HUB, NODE_ENABLED_KEY, NodeStore, operation_proxy
 from .theme import system_theme
 
@@ -220,8 +221,7 @@ class WebWindow(QMainWindow):
                 state = badge + f"已安装 · 版本 {record.get('version', '未知')}{self.version_note(product)}"
             else:
                 state = badge + '未安装 · 可全新安装'
-                buttons = [{'t': '全新安装', 'a': 'game-update', 'pri': True},
-                           {'t': '目录', 'a': 'game-dir'}, {'t': '详情', 'a': 'detail-open'}]
+                buttons = [{'t': '全新安装', 'a': 'game-update', 'pri': True}, {'t': '详情', 'a': 'detail-open'}]
             cards.append({'product': product, 'title': title, 'state': state, 'adult': product in adult,
                           'badges': self.card_badges(state), 'cover': cover_uri(product),
                           'coverBase': cover_base(product), 'buttons': buttons})
@@ -273,7 +273,10 @@ class WebWindow(QMainWindow):
                 'state': f'生效代理：{self.settings.get("proxy", "")}\n可用节点：{enabled} 个',
                 'mode': 0 if self.settings.get(NODE_ENABLED_KEY, True) else 1,
                 'proxy': self.settings.get('proxy', ''),
-                'sysproxy': system_proxy_active()}
+                'sysproxy': system_proxy_active(),
+                'installBase': str(self.settings.get('install_base', '') or ''),
+                'defaultBase': str(default_install_base()),
+                'askInstall': bool(self.settings.get('ask_install_dir', True))}
 
     def push_snapshot(self):
         try:
@@ -318,7 +321,7 @@ class WebWindow(QMainWindow):
             note = '版本由后台清单校验自动纠正；游戏自己更新过也会显示正确版本。'
         else:
             state_line = '未安装'
-            buttons = [{'t': '全新安装', 'a': 'game-update', 'pri': True}, {'t': '选择目录', 'a': 'game-dir'}]
+            buttons = [{'t': '全新安装', 'a': 'game-update', 'pri': True}]
             note = '「全新安装」直接从 DMM CDN 下载到本客户端目录，不需要官方 Player。'
         self.send(type='detail', product=product, open=open_view,
                   title=self.known_titles().get(product, product), cover=cover_uri(product),
@@ -427,8 +430,10 @@ class WebWindow(QMainWindow):
         self.push_snapshot()
 
     def worker_settings(self):
-        self.settings = {'proxy': valid_proxy(self.settings.get('proxy', '')),
-                         NODE_ENABLED_KEY: bool(self.settings.get(NODE_ENABLED_KEY, True))}
+        settings = dict(self.settings)          # 保留 install_base 等非代理键
+        settings.update({'proxy': valid_proxy(self.settings.get('proxy', '')),
+                         NODE_ENABLED_KEY: bool(self.settings.get(NODE_ENABLED_KEY, True))})
+        self.settings = settings
         return self.settings
 
     # ---------- 应用内商店页 ----------
@@ -469,10 +474,24 @@ class WebWindow(QMainWindow):
         if action == 'open-url': self.open_store_page(payload.get('url', '')); return
         if action == 'system-proxy': self.toggle_system_proxy(payload.get('on')); return
         if action == 'settings':
-            self.settings = {'proxy': valid_proxy(str(payload.get('proxy', '')).strip()),
-                             NODE_ENABLED_KEY: bool(payload.get('mode', True))}
+            self.settings.update({'proxy': valid_proxy(str(payload.get('proxy', '')).strip()),
+                                  NODE_ENABLED_KEY: bool(payload.get('mode', True))})
+            base = str(payload.get('install_base', '') or '').strip()
+            if base:
+                self.settings['install_base'] = str(Path(base).expanduser().resolve())
+            else:
+                self.settings.pop('install_base', None)
+            self.settings['ask_install_dir'] = bool(payload.get('ask', True))
             atomic_write(data_dir() / 'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
-            self.report('代理设置已保存'); return
+            self.report('设置已保存'); return
+        if action == 'browse-base':
+            chosen = QFileDialog.getExistingDirectory(self, '选择默认游戏库（游戏会装到其下的子目录）',
+                                                      str(global_install_base(self.settings)))
+            if chosen:
+                path = str(Path(chosen).resolve()).replace('\\', '\\\\')
+                self.view.page().runJavaScript(
+                    f"var el=document.getElementById('defaultbase'); if(el) el.value='{path}'; 1")
+            return
         if action == 'save-account':
             self.run_action('save-account', number=str(payload.get('number', '')).strip(),
                             name=str(payload.get('name', '')).strip()); return
@@ -568,10 +587,49 @@ class WebWindow(QMainWindow):
             self, f'选择「{title}」的安装位置（会在其中创建 {product} 子目录）', start)
         return Path(chosen).resolve() if chosen else None
 
+    def pick_install_base_with_option(self, product):
+        """安装时的位置选择：可勾「不再提示」把这里设为默认游戏库（之后可在设置改）。"""
+        title = self.known_titles().get(product, product)
+        start = str(global_install_base(self.settings))
+        Path(start).mkdir(parents=True, exist_ok=True)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f'选择「{title}」的安装位置')
+        box = QVBoxLayout(dialog)
+        edit = QLineEdit(start); box.addWidget(edit)
+        browse = QPushButton('浏览…')
+        browse.clicked.connect(lambda: edit.setText(
+            QFileDialog.getExistingDirectory(dialog, '选择安装位置', edit.text() or start) or edit.text()))
+        box.addWidget(browse)
+        hint = QLabel(f'游戏会安装到所选目录下的 {product} 子目录。')
+        box.addWidget(hint)
+        remember = QCheckBox('不再提示：以后都装到这个目录（可在网络页的「游戏安装」里修改）')
+        box.addWidget(remember)
+        buttons = QHBoxLayout(); buttons.addStretch()
+        ok = QPushButton('开始安装'); ok.setDefault(True)
+        cancel = QPushButton('取消')
+        buttons.addWidget(cancel); buttons.addWidget(ok); box.addLayout(buttons)
+        ok.clicked.connect(dialog.accept); cancel.clicked.connect(dialog.reject)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        text = edit.text().strip()
+        if not text: return None
+        base = Path(text).expanduser().resolve()
+        if remember.isChecked():
+            self.settings['install_base'] = str(base)
+            self.settings['ask_install_dir'] = False
+            save_settings(self.settings)
+            self.report(f'默认游戏库已设为 {base}，之后安装不再询问；可在网络页的「游戏安装」里修改')
+        return base
+
     def ensure_install_location(self, product):
+        """全新安装的目标目录：该游戏选过就用它；否则按默认库设置（不再提示模式直接用）。"""
         if install_bases().get(product):
             return game_install_root(product)
-        base = self.pick_install_base(product)
+        if self.settings.get('install_base') and not self.settings.get('ask_install_dir', True):
+            base = global_install_base(self.settings)
+            remember_install_base(product, base)
+            return base / product
+        base = self.pick_install_base_with_option(product)
         if base is None: return None
         remember_install_base(product, base)
         return base / product
