@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,6 +93,52 @@ class ModuleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'x.dll'; path.write_bytes(b'MZ')
             with self.assertRaises(DmmError): service._run_module(path)
+
+
+class MoveTests(unittest.TestCase):
+    """移动游戏目录：先完整复制、再删源目录，并更新安装记录。"""
+
+    def _tree(self, root):
+        (root / 'data').mkdir(parents=True)
+        (root / 'game.exe').write_bytes(b'MZ')
+        (root / 'data' / 'a.bin').write_bytes(b'x' * 16)
+
+    def test_move_relocates_files_and_keeps_record_in_sync(self):
+        from dmmclient.backend.games import move_game
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
+            root = Path(source) / 'game1'; self._tree(root)
+            written = {}
+            with patch('dmmclient.backend.games.records',
+                       return_value={'game1': {'root': str(root), 'version': '1'}}), \
+                 patch('dmmclient.backend.games.atomic_write',
+                       side_effect=lambda path, blob: written.update({path.name: json.loads(blob)})), \
+                 patch('dmmclient.backend.games.remember_install_base'), \
+                 patch('dmmclient.backend.games.game_running', return_value=False):
+                moved = move_game('game1', target)
+            self.assertEqual(moved, Path(target).resolve() / 'game1')
+            self.assertFalse(root.exists(), '源目录应已删除')
+            self.assertTrue((moved / 'game.exe').is_file())
+            self.assertTrue((moved / 'data' / 'a.bin').is_file())
+            self.assertEqual(written['games.json']['game1']['root'], str(moved))
+
+    def test_move_refuses_while_the_game_runs(self):
+        from dmmclient.backend.games import move_game
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
+            root = Path(source) / 'game1'; self._tree(root)
+            with patch('dmmclient.backend.games.records', return_value={'game1': {'root': str(root)}}), \
+                 patch('dmmclient.backend.games.game_running', return_value=True):
+                with self.assertRaises(DmmError): move_game('game1', target)
+            self.assertTrue(root.exists(), '拒绝后源目录必须完好')
+
+    def test_move_refuses_non_empty_target(self):
+        from dmmclient.backend.games import move_game
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
+            root = Path(source) / 'game1'; self._tree(root)
+            occupied = Path(target) / 'game1'; occupied.mkdir(); (occupied / 'keep').write_bytes(b'1')
+            with patch('dmmclient.backend.games.records', return_value={'game1': {'root': str(root)}}), \
+                 patch('dmmclient.backend.games.game_running', return_value=False):
+                with self.assertRaises(DmmError): move_game('game1', target)
+            self.assertTrue(root.exists())
 
 
 if __name__=='__main__': unittest.main()

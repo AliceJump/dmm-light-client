@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 from html import unescape
 from pathlib import Path
@@ -15,6 +16,7 @@ import requests
 
 from .helper import windows_args
 from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir, dmm_url
+from .settings import game_install_root, remember_install_base
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
 
 SUPPORTED = {'priconner': '公主连结 Re:Dive（日服）'}
@@ -182,6 +184,64 @@ def save_cover(http, product, root, progress=lambda message: None):
 def records():
     path = data_dir() / 'games.json'
     return json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+
+
+def game_root(product):
+    """已安装游戏的当前目录（本客户端记录优先，其次官方 Player 记录）。"""
+    record = records().get(product) or official_record(product)
+    root = (record or {}).get('root')
+    return Path(root).resolve() if root else None
+
+
+def game_running(root):
+    """该目录下是否有进程正在运行。"""
+    target = Path(root).resolve()
+    for process in psutil.process_iter(['exe']):
+        try:
+            exe = process.info.get('exe')
+            if exe and Path(exe).resolve().is_relative_to(target):
+                return True
+        except (psutil.Error, OSError):
+            continue
+    return False
+
+
+def move_game(product, base, progress=lambda done, total: None,
+              cancel_check=lambda: None, message=lambda text: None):
+    """把已安装的游戏整体搬到新的基准目录（装到 <base>/<product>），跨盘可用。
+
+    先完整复制、最后才删源目录：中途失败或取消时源目录依然完整。
+    """
+    record = records().get(product)
+    if not record or not record.get('root'):
+        raise DmmError('该游戏不是由本客户端安装的，无法移动目录')
+    source = Path(record['root']).resolve()
+    target = Path(base).expanduser().resolve() / product
+    if source == target:
+        message('游戏已经在该目录下')
+        return target
+    if target.exists() and any(target.iterdir()):
+        raise DmmError('目标目录不为空，请换一个位置')
+    if game_running(source):
+        raise DmmError('该游戏正在运行，请先关闭游戏再移动目录')
+    files = [path for path in source.rglob('*') if path.is_file()]
+    total = sum(path.stat().st_size for path in files)
+    message(f'移动 {len(files)} 个文件 · {total / 1048576:.1f} MiB 到 {target}')
+    done = 0
+    for path in files:
+        cancel_check()
+        destination = target / path.relative_to(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+        done += path.stat().st_size
+        progress(done, total)
+    cancel_check()
+    shutil.rmtree(source)
+    value = records()
+    value[product] = {**value[product], 'root': str(target)}
+    atomic_write(data_dir() / 'games.json', json.dumps(value, ensure_ascii=False).encode())
+    remember_install_base(product, base)
+    return target
 
 
 class GameService:
@@ -401,8 +461,8 @@ class GameService:
             return (f"最新版本 {info.get('latest_version','?')} · {size/1048576:.1f} MiB · 尚未安装："
                     '点「全新安装」开始下载')
         if installing:
-            if install_root is None and action in {'check','install'}:
-                install_root=data_dir()/'games'/self.product
+            if install_root is None and action in {'check','install','update'}:
+                install_root=game_install_root(self.product)
             if install_root is None: raise DmmError('请先安装游戏')
             root=Path(install_root).resolve()
         else: root=Path(saved['root']).resolve()

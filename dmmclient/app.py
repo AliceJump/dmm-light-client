@@ -23,22 +23,16 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
     QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
-from .backend.games import (SUPPORTED, GameService, catalog, cover_path,
-    installed_record, official_record, official_records, records,
+from .backend.games import (SUPPORTED, GameService, catalog, cover_path, game_root,
+    installed_record, move_game, official_record, official_records, records,
     refresh_catalog, save_cover)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
     atomic_write, data_dir, dmm_url, valid_proxy)
+from .backend.settings import (load_settings, remember_install_base, game_install_base,
+    game_install_root, install_bases)
 from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
-
-
-def load_settings():
-    path = data_dir() / 'settings.json'
-    defaults = {'proxy': 'http://127.0.0.1:10808', NODE_ENABLED_KEY: True}
-    if path.exists():
-        defaults.update(json.loads(path.read_text(encoding='utf-8')))
-    return defaults
 
 
 def divider():
@@ -216,11 +210,11 @@ class Worker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, action, settings, number='', name='', node_text='', product='', parent=None):
+    def __init__(self, action, settings, number='', name='', node_text='', product='', extra='', parent=None):
         super().__init__(parent)
         self.action, self.settings = action, dict(settings)
         self.number, self.name, self.node_text = number, name, node_text
-        self.product = product
+        self.product, self.extra = product, extra
         self.cancelled = threading.Event()
         self.start_time = time.monotonic()
 
@@ -249,6 +243,11 @@ class Worker(QThread):
                 if self.action == 'import-node':
                     NodeStore(root).import_node(self.node_text, self.settings['proxy'], self.message.emit)
                     self.finished_ok.emit('节点已加密导入'); return
+                if self.action == 'game-move':
+                    # 纯本地文件搬运，不需要代理
+                    target = move_game(self.product, self.extra, self.progress, self.check_cancel, self.message.emit)
+                    self.finished_ok.emit(f'游戏目录已移动到 {target}')
+                    return
                 with operation_proxy(self.settings, self.message.emit, self.check_cancel, root) as proxy:
                     if self.action == 'test':
                         with requests.Session() as http:
@@ -325,7 +324,7 @@ class Worker(QThread):
             if action == 'update' and not installed_record(self.product):
                 action = 'install'  # 未安装过的游戏直接全新安装
             service = GameService(helper.session, self.product, self.message.emit, self.progress)
-            return service.execute(action)
+            return service.execute(action, self.extra or None)
         raise DmmError('未知操作')
 
 
@@ -536,11 +535,13 @@ class Window(QMainWindow):
         for product, value in sorted(installed.items()):
             if product == 'gakumas': continue  # 学园偶像大师固定为第一张卡片
             title = titles.get(product, product)
-            origin = '官方 Player 安装 · ' if product not in records() else ''
+            managed = product in records()
+            origin = '' if managed else '官方 Player 安装 · '
+            buttons = [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False)]
+            if managed: buttons.append(('目录', 'game-dir', False))   # 官方装的不动它的目录
             self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
                 self.library_covers, product, title,
-                f"{origin}已安装 · 版本 {value.get('version', '未知')}",
-                [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False)]))
+                f"{origin}已安装 · 版本 {value.get('version', '未知')}", buttons))
         self._restore_scroll(self.library_grid, offset)
 
     def repopulate_store(self, keep_scroll=False):
@@ -560,10 +561,13 @@ class Window(QMainWindow):
             record = installed.get(product)
             badge = 'Fanza R18 · ' if product in adult else ''
             if record:
-                state, buttons = badge + f"已安装 · 版本 {record.get('version', '未知')}", \
-                    [('启动', 'game-launch', True), ('更新', 'game-update', False), ('详情', 'detail-open', False)]
+                buttons = [('启动', 'game-launch', True), ('更新', 'game-update', False)]
+                if product in records(): buttons.append(('目录', 'game-dir', False))
+                buttons.append(('详情', 'detail-open', False))
+                state = badge + f"已安装 · 版本 {record.get('version', '未知')}"
             else:
-                state, buttons = badge + '未安装 · 可全新安装', [('全新安装', 'game-update', True), ('详情', 'detail-open', False)]
+                state = badge + '未安装 · 可全新安装'
+                buttons = [('全新安装', 'game-update', True), ('目录', 'game-dir', False), ('详情', 'detail-open', False)]
             self.add_card(self.store_grid, self.make_card(self.store_grid, self.store_buttons,
                 self.store_covers, product, title, state, buttons))
         self._restore_scroll(self.store_grid, offset)
@@ -785,6 +789,8 @@ class Window(QMainWindow):
                 with helper_lock(data_dir()):
                     atomic_write(data_dir() / 'installation.json', json.dumps({'root':str(root),'version':'未知'}).encode())
                 self.refresh(); self.report('游戏目录已保存'); return
+            if action == 'game-dir':
+                self.choose_game_directory(product); return
             self.settings = {'proxy': valid_proxy(self.proxy.text().strip()), NODE_ENABLED_KEY: self.mode.currentIndex()==0}
             atomic_write(data_dir()/'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
             if action == 'settings': self.status.setText('代理设置已保存'); return
@@ -798,21 +804,69 @@ class Window(QMainWindow):
             number = self.accounts.currentData() if action == 'switch-account' else self.number.text().strip()
             if action == 'switch-account' and not number: raise DmmError('请先保存并选择账号')
             if action.startswith('game-') and not product: raise DmmError('请先选择游戏')
-            request = (action, dict(self.settings), number, self.name.text().strip(), node_text, product)
-            if self.worker and self.worker.isRunning():
-                # 不拒绝：排进队列，当前操作结束后自动接着跑
-                self.pending_actions.append(request)
-                self.report(f'已排入队列（{len(self.pending_actions)} 个待执行），当前操作结束后自动开始')
-                return
-            self.start_operation(request)
+            extra = ''
+            if action == 'game-update' and product and not installed_record(product):
+                # 全新安装：先确定装到哪里；用户没选过就问一次
+                location = self.ensure_install_location(product)
+                if location is None: return
+                extra = str(location)
+            self.enqueue_or_start((action, dict(self.settings), number,
+                                   self.name.text().strip(), node_text, product, extra))
         except (DmmError, OSError, UnicodeError) as error:
             self.report(str(error) if isinstance(error,DmmError) else '配置文件无法读取')
         except Exception:
             self.report('操作未能开始，详情见 client.log'); raise
 
+    def enqueue_or_start(self, request):
+        """把操作交给 Worker；已有操作在跑就排队，不拒绝。"""
+        if self.worker and self.worker.isRunning():
+            self.pending_actions.append(request)
+            self.report(f'已排入队列（{len(self.pending_actions)} 个待执行），当前操作结束后自动开始')
+            return
+        self.start_operation(request)
+
+    def pick_install_base(self, product):
+        """弹目录选择框，返回用户选的基准目录（游戏会装到 <基准>/<product>）。"""
+        title = self.known_titles().get(product, product)
+        start = str(game_install_base(product))
+        Path(start).mkdir(parents=True, exist_ok=True)
+        chosen = QFileDialog.getExistingDirectory(
+            self, f'选择「{title}」的安装位置（会在其中创建 {product} 子目录）', start)
+        return Path(chosen).resolve() if chosen else None
+
+    def ensure_install_location(self, product):
+        """全新安装的目标目录：选过就直接用，没选过问一次。"""
+        if install_bases().get(product):
+            return game_install_root(product)
+        base = self.pick_install_base(product)
+        if base is None: return None
+        remember_install_base(product, base)
+        return base / product
+
+    def choose_game_directory(self, product):
+        """卡片上的「目录」：未安装=预设安装位置，本客户端装的=移动过去。"""
+        title = self.known_titles().get(product, product)
+        if records().get(product):
+            base = self.pick_install_base(product)
+            if base is None: return
+            self.dispatch('game-move', product, str(base))
+            return
+        if installed_record(product):
+            self.report('该游戏由官方 Player 安装，本客户端不移动它的目录')
+            return
+        base = self.pick_install_base(product)
+        if base is None: return
+        remember_install_base(product, base)
+        self.report(f'「{title}」的安装位置已设为 {base / product}')
+        self.refresh()
+
+    def dispatch(self, action, product='', extra=''):
+        self.enqueue_or_start((action, dict(self.settings), self.number.text().strip(),
+                               self.name.text().strip(), self.node_text.text(), product, extra))
+
     def start_operation(self, request):
-        action, settings, number, name, node_text, product = request
-        self.worker = Worker(action, settings, number, name, node_text, product, self)
+        action, settings, number, name, node_text, product, extra = request
+        self.worker = Worker(action, settings, number, name, node_text, product, extra, self)
         self.worker.message.connect(self.report)
         self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
         self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)

@@ -14,12 +14,38 @@
 
 密码与验证码由用户在 DMM 官方网页输入。默认浏览器登录临时使用所选 HTTP 代理，完成或取消后恢复。SOCKS5 用于 API 和下载；浏览器登录请使用 HTTP 或内置节点池。
 
-游戏目录可以手动选择，第一次也可只读识别官方 Player 安装记录。保存本客户端的安装记录后，后续不需要官方 Player 安装配置。不会修改官方 Player 的账号或配置文件。
+**每款游戏都能单独选目录**（不只学园偶像大师）：卡片上的「目录」按钮，未安装时用来预设安装位置，已安装时就是把游戏整体搬过去（跨盘可用、带进度、先完整复制再删源目录，中途失败源目录仍完好）。安装位置按「基准目录」记，游戏实际装在 `<基准目录>/<游戏编号>`。第一次全新安装会弹一次目录选择（默认 `<数据目录>/games`），选过就记住；也可以用命令行的 `dmmcli dir` / `dmmcli move` 改。第一次也可只读识别官方 Player 安装记录，但不会移动官方安装的游戏。不会修改官方 Player 的账号或配置文件。
 
-支持已安装的学园偶像大师；其他免费下载型游戏可先「刷新游戏列表」再选择，直接全新安装、检查更新和启动，无需预先下载过。目录同时覆盖一般版与 Fanza 版（标记 R18），一次刷新全部拿到：Fanza 游戏走 `ACL` 类型与 `app-gameplayer.dmm.co.jp` 域名，需要已完成年龄认证的 DMM 账号（客户端通过 `age_check_done` cookie 声明）。未加库的游戏安装时自动调用官方加库接口加入游戏库；**首次安装与首次启动都不需要官方 Player**——DMM 对「尚未同意该游戏利用规约」的账号会拒绝 `install` 与 `launch` 接口（`result_code=308`，官方错误码表为 `NOT_CONSENT_AGREEMENT`），客户端在你主动点安装/启动时自动代为提交该游戏的利用规约同意（`/v5/agreement/confirm/client`），随后正常安装与启动；若 `install` 仍被拒，再退回下载清单接口 `/v5/r2/filelist/cl` 直接取得文件清单与 CloudFront 签名 cookie（与官方 `cex.dll` 下载时同源）。下载一律从 CDN 直连并逐文件 MD5 校验，支持断点续传。新游戏安装在本客户端数据目录的 `games/<游戏编号>` 中，安装记录写入独立 `games.json`，不会写入官方 Player。仅支持标准下载型游戏（GCL/ACL）；需要专用安装程序或 DRM 授权的游戏会明确提示暂不支持。部分游戏（如 アサルトリリィ、DOAXVV）要求先装系统运行库（VC++ 运行库 / DirectX），客户端会像官方 Player 一样自动下载这些模块并以管理员身份运行（可能弹出 UAC），已装过同一版本的会跳过。
+支持已安装的学园偶像大师；其他免费下载型游戏可先「刷新游戏列表」再选择，直接全新安装、检查更新和启动，无需预先下载过。目录同时覆盖一般版与 Fanza 版（标记 R18），一次刷新全部拿到：Fanza 游戏走 `ACL` 类型与 `app-gameplayer.dmm.co.jp` 域名，需要已完成年龄认证的 DMM 账号（客户端通过 `age_check_done` cookie 声明）。未加库的游戏安装时自动调用官方加库接口加入游戏库；**首次安装与首次启动都不需要官方 Player**——DMM 对「尚未同意该游戏利用规约」的账号会拒绝 `install` 与 `launch` 接口（`result_code=308`，官方错误码表为 `NOT_CONSENT_AGREEMENT`），客户端在你主动点安装/启动时自动代为提交该游戏的利用规约同意（`/v5/agreement/confirm/client`），随后正常安装与启动；若 `install` 仍被拒，再退回下载清单接口 `/v5/r2/filelist/cl` 直接取得文件清单与 CloudFront 签名 cookie（与官方 `cex.dll` 下载时同源）。下载一律从 CDN 直连并逐文件 MD5 校验，支持断点续传。新游戏默认装在 `<数据目录>/games/<游戏编号>`，位置可改（见上），安装记录写入独立 `games.json`，不会写入官方 Player。仅支持标准下载型游戏（GCL/ACL）；需要专用安装程序或 DRM 授权的游戏会明确提示暂不支持。部分游戏（如 アサルトリリィ、DOAXVV）要求先装系统运行库（VC++ 运行库 / DirectX），客户端会像官方 Player 一样自动下载这些模块并以管理员身份运行（可能弹出 UAC），已装过同一版本的会跳过。
 
 实测公主连结 12.7.2 下载约 248 MiB，29 个文件全部校验通过，未经过官方 Player 即启动到标题画面。游戏首次运行还可能需要自行下载额外资源；标题画面不等于游戏内登录完成。
 
-尚未实现付费游戏、卸载、订阅刷新、商店与付费操作，也未制作单文件安装包。额外安装程序、模块和 DRM 流程暂不支持。游戏运行后的网络由游戏自身处理，本客户端代理负责登录、清单、更新和下载。
+尚未实现付费游戏、卸载、订阅刷新、商店与付费操作，也未制作单文件安装包。需要专用安装程序（installer）或 DRM 授权的游戏仍会明确提示暂不支持。游戏运行后的网络由游戏自身处理，本客户端代理负责登录、清单、更新和下载。
+
+## 命令行
+
+图形界面之外还带一套命令行，复用同一份数据、登录态和节点配置，不需要 Qt：
+
+```bat
+dmmcli list                             已安装的游戏（编号 / 版本 / 目录 / 来源）
+dmmcli list --json                      同上，JSON 输出
+dmmcli catalog -q ウマ娘                 在本地缓存的目录里搜索
+dmmcli catalog --filter adult            只看 Fanza R18
+dmmcli refresh                          联网刷新游戏目录
+dmmcli check umamusume                  只查版本，不下载
+dmmcli install umamusume                全新安装（默认装到 <数据目录>/games/umamusume）
+dmmcli install umamusume --dir D:\GAMES\DMM   指定基准目录，实际装到 D:\GAMES\DMM\umamusume
+dmmcli update umamusume                 更新到最新版
+dmmcli launch umamusume                 启动（启动前自动检查并更新）
+dmmcli dir umamusume                    看当前目录与安装位置
+dmmcli dir umamusume --set E:\Games     改安装位置
+dmmcli move umamusume --dir E:\Games    把已装好的游戏搬过去
+dmmcli accounts                         列出账号；--switch 12345 切换
+dmmcli nodes                            列出已导入节点
+dmmcli proxy                            查看代理；dmmcli proxy http://127.0.0.1:10808 修改
+dmmcli ping                             测试 DMM 连接与登录态
+```
+
+`uv sync` 会生成 `dmmcli` 命令；项目根目录也放了 `dmmcli.cmd` 包装（免激活虚拟环境），也可以直接用 `python -m dmmclient.cli`。登录态失效时会提示先在图形界面登录一次（命令行不弹浏览器）。
 
 开发验证：`.venv\Scripts\python.exe -m unittest discover -s tests`。

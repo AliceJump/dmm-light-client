@@ -1,3 +1,4 @@
+import json
 import os
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 import tempfile
@@ -155,6 +156,31 @@ class ClientTests(unittest.TestCase):
             self.assertEqual([request[0] for request in window.pending_actions], ['game-update'])
             window.pending_actions.clear(); window.worker = None
             window.close(); window.deleteLater(); app.processEvents()
+
+    def test_every_game_can_pick_its_install_directory(self):
+        """所有游戏（不只学园偶像大师）都能指定安装目录。"""
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as target, \
+                patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None):
+            data_dir().mkdir(parents=True, exist_ok=True)
+            (data_dir() / 'catalog.json').write_text(json.dumps([
+                {'product': 'umamusume', 'title': 'Uma', 'adult': False, 'link': ''}]), encoding='utf-8')
+            window = Window()
+            self.assertIn('目录', [button.text() for button in window.store_buttons])
+            with patch('dmmclient.app.QFileDialog.getExistingDirectory', return_value=target):
+                location = window.ensure_install_location('umamusume')
+            self.assertEqual(location, Path(target).resolve() / 'umamusume')
+            # 选过一次就记住，不再追问
+            self.assertEqual(window.ensure_install_location('umamusume'), Path(target).resolve() / 'umamusume')
+            window.close(); window.deleteLater(); app.processEvents()
+
+    def test_install_location_defaults_to_client_games_dir(self):
+        from dmmclient.backend.settings import game_install_root
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}):
+            self.assertEqual(game_install_root('priconner'),
+                             Path(folder) / 'DmmLightClient' / 'games' / 'priconner')
 
     def test_refresh_keeps_card_wall_scroll_position(self):
         """安装完成后的刷新不应把卡片墙弹回顶部（clear() 会把滚动条归零）。"""
