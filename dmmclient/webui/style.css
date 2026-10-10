@@ -138,7 +138,20 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .links button.danger:hover{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent)}
 
 /* ---------- 详情视图 ---------- */
-.detail-wrap{display:flex;gap:18px;align-items:flex-start;animation:detailIn .5s var(--ease-out)}
+/* 入场：整页淡入平移（GPU 合成属性，无 blur，避免大子树模糊重绘卡顿） */
+.detail-wrap{display:flex;gap:18px;align-items:flex-start;animation:detailIn .4s var(--ease-out)}
+@keyframes detailIn{from{opacity:0;transform:translateX(28px) scale(.98)}
+                    to{opacity:1;transform:none}}
+/* 切游戏 / 增量刷新：只有右侧详情重建，动画只落在 .pane 上 */
+.pane{animation:paneIn .3s var(--ease-out)}
+@keyframes paneIn{from{opacity:0;transform:translateX(14px)}
+                  to{opacity:1;transform:none}}
+/* 截图灯箱 */
+.lightbox{position:fixed;inset:0;z-index:99;display:flex;align-items:center;justify-content:center;
+      background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(8px);cursor:zoom-out}
+.lightbox img{max-width:92vw;max-height:92vh;border-radius:var(--r-lg);
+      box-shadow:0 24px 80px rgba(0,0,0,.5);animation:paneIn .25s var(--ease-out)}
+.pane .shots img{cursor:zoom-in}
 @keyframes detailIn{from{opacity:0;transform:translateX(28px) scale(.98);filter:blur(6px)}
                     to{opacity:1;transform:none;filter:none}}
 .gamelist{width:300px;flex:none;display:flex;flex-direction:column;gap:6px;max-height:calc(100vh - 210px);

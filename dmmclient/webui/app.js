@@ -288,11 +288,15 @@ function patchGamelist(container, rows, current) {
   const existing = new Map([...container.querySelectorAll(':scope > .row')]
     .map(el => [el.dataset.row, el]));
   const seen = new Set();
+  // 顺序与现状完全一致时跳过 appendChild 挪动（挪 146 个节点会造成整列重排卡顿）
+  const domRows = [...container.children];
+  const inOrder = rows.length === domRows.length &&
+    rows.every((r, i) => domRows[i].dataset.row === r.product);
   rows.forEach(r => {
     const sig = JSON.stringify([r.title, r.meta, !!r.cover, r.product === current]);
     let el = existing.get(r.product);
     if (el && el.dataset.sig === sig) {
-      container.appendChild(el);
+      if (!inOrder) container.appendChild(el);
     } else {
       const tpl = document.createElement('template');
       tpl.innerHTML = rowHtml(r, r.product === current).trim();
@@ -438,6 +442,22 @@ $('pause').onclick = () => call('cancel');
 $('logbtn').onclick = () => $('logbox').classList.toggle('hidden');
 document.addEventListener('change', ev => {
   if (ev.target.id === 'sysproxy') call('system-proxy', {on: ev.target.checked});
+});
+
+/* 截图灯箱：点开放大，点击任意处或 Esc 关闭 */
+const lightbox = $('lightbox');
+document.addEventListener('click', ev => {
+  const shot = ev.target.closest('.pane .shots img');
+  if (shot) {
+    lightbox.querySelector('img').src = shot.currentSrc || shot.src;
+    lightbox.classList.remove('hidden');
+    return;
+  }
+  if (ev.target.closest('#lightbox')) lightbox.classList.add('hidden');
+});
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && !lightbox.classList.contains('hidden'))
+    lightbox.classList.add('hidden');
 });
 
 /* ---------- 启动 ---------- */
