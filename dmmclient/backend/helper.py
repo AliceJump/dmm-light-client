@@ -216,8 +216,16 @@ class DmmHelper:
         result = {"latest_version": spec.version, "files": len(spec.plan.files),
                   "pending_files": len(pending), "download_bytes": sum(f.size for f in pending if not f.delete),
                   "delete_files": sum(f.delete for f in pending), "exe_present": spec.exe.is_file()}
+        if not pending:
+            # 本地文件与最新清单一致：游戏已经是这个版本了（可能被游戏自己更新过）
+            self._remember_version(spec)
         self.progress(f"版本 {spec.version}：需更新 {len(pending)} 个文件，下载 {result['download_bytes'] / 1024 / 1024:.1f} MiB")
         return result
+
+    def _remember_version(self, spec):
+        atomic_write(self.session.root / "installation.json", json.dumps({
+            "root": str(spec.plan.root), "version": spec.version,
+        }).encode())
 
     def prepare(self, auto_update=True):
         ensure_game_stopped()
@@ -229,13 +237,12 @@ class DmmHelper:
                 raise DmmError("游戏文件需要更新，请启用自动更新或运行 python -m dmmclient.backend update")
             ensure_update_idle()
             updater.run()
-            atomic_write(self.session.root / "installation.json", json.dumps({
-                "root": str(spec.plan.root), "version": spec.version,
-            }).encode())
             # Launch tokens obtained before a potentially long update are not reused.
             spec = self.fetch()
             if spec.plan.pending():
                 raise DmmError("更新期间服务器版本已改变，请重试")
+        # 文件已与最新清单一致，把版本记下来（游戏自己更新过时也能纠正）
+        self._remember_version(spec)
         if not spec.exe.is_file():
             raise DmmError("游戏可执行文件不存在")
         return spec

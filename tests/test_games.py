@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -139,6 +140,72 @@ class MoveTests(unittest.TestCase):
                  patch('dmmclient.backend.games.game_running', return_value=False):
                 with self.assertRaises(DmmError): move_game('game1', target)
             self.assertTrue(root.exists())
+
+
+class VersionTests(unittest.TestCase):
+    """版本记录必须反映实际：游戏自己更新过时本地记录会过期，要能纠正回来。"""
+
+    def test_check_records_the_version_when_files_already_match(self):
+        session = Mock(); session.device = {}
+        session.request.side_effect = [
+            {'game_type': 'GCL'},
+            {'product_id': 'priconner', 'latest_version': '12.8.0', 'file_list_url': '/m', 'sign': 's'},
+        ]
+        service = GameService(session, 'priconner')
+        plan = Mock(); plan.pending.return_value = []
+        service.plan = Mock(return_value=plan)
+        service.updater = Mock(return_value=Mock())
+        written = {}
+        with patch('dmmclient.backend.games.records',
+                   return_value={'priconner': {'root': str(Path(tempfile.gettempdir())), 'version': '12.7.2'}}), \
+             patch('dmmclient.backend.games.atomic_write',
+                   side_effect=lambda path, blob: written.update({path.name: json.loads(blob)})):
+            service.execute('check')
+        self.assertEqual(written['games.json']['priconner']['version'], '12.8.0',
+                         '本地文件与清单一致时，记录应更新为服务器版本')
+
+    def test_check_keeps_the_record_when_files_differ(self):
+        session = Mock(); session.device = {}
+        session.request.side_effect = [
+            {'game_type': 'GCL'},
+            {'product_id': 'priconner', 'latest_version': '12.8.0', 'file_list_url': '/m', 'sign': 's'},
+        ]
+        service = GameService(session, 'priconner')
+        plan = Mock(); plan.pending.return_value = [Mock(size=10)]
+        service.plan = Mock(return_value=plan)
+        service.updater = Mock(return_value=Mock())
+        with patch('dmmclient.backend.games.records',
+                   return_value={'priconner': {'root': str(Path(tempfile.gettempdir())), 'version': '12.7.2'}}), \
+             patch('dmmclient.backend.games.atomic_write') as write:
+            service.execute('check')
+        write.assert_not_called()
+
+    def test_record_version_writes_to_the_right_record(self):
+        from dmmclient.backend.games import record_version
+        from dmmclient.backend.session import data_dir
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}):
+            data_dir().mkdir(parents=True, exist_ok=True)
+            (data_dir() / 'games.json').write_text(
+                json.dumps({'priconner': {'root': 'D:/g', 'version': '1'}}), encoding='utf-8')
+            record_version('priconner', '2')
+            self.assertEqual(json.loads((data_dir() / 'games.json').read_text(encoding='utf-8'))
+                             ['priconner']['version'], '2')
+            record_version('gakumas', '3.4.1', 'D:/GAMES/DMM_GAME/gakumas')
+            self.assertEqual(json.loads((data_dir() / 'installation.json').read_text(encoding='utf-8')),
+                             {'root': 'D:/GAMES/DMM_GAME/gakumas', 'version': '3.4.1'})
+
+    def test_verify_version_only_reports_a_version_when_files_match(self):
+        from dmmclient.backend.games import verify_version
+        session = Mock(); session.device = {}
+        with patch.object(GameService, 'request_info', return_value={'latest_version': '3.4.1'}), \
+             patch.object(GameService, 'plan') as plan:
+            plan.return_value.pending.return_value = []
+            self.assertEqual(verify_version(session, 'priconner', 'D:/g')['version'], '3.4.1')
+            plan.return_value.pending.return_value = [1, 2]
+            result = verify_version(session, 'priconner', 'D:/g')
+            self.assertIsNone(result['version'], '还有文件待更新时不能声称已是新版本')
+            self.assertEqual(result['pending'], 2)
+            self.assertEqual(result['latest'], '3.4.1')
 
 
 if __name__=='__main__': unittest.main()

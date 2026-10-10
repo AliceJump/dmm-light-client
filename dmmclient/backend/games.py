@@ -206,6 +206,38 @@ def game_running(root):
     return False
 
 
+def record_version(product, version, root=None):
+    """把核对出来的真实版本写回安装记录（游戏自己更新过时记录会过期）。"""
+    value = records()
+    if product in value:
+        value[product] = {**value[product], 'version': str(version)}
+        atomic_write(data_dir() / 'games.json', json.dumps(value, ensure_ascii=False).encode())
+        return
+    if product == 'gakumas':
+        path = data_dir() / 'installation.json'
+        try:
+            current = json.loads(path.read_text(encoding='utf-8'))
+            root = root or current.get('root')
+        except Exception:
+            pass
+        if root:
+            atomic_write(path, json.dumps({'root': str(root), 'version': str(version)}).encode())
+
+
+def verify_version(session, product, root, progress=lambda message: None):
+    """核对已安装游戏的真实版本：本地文件与最新清单一致就以服务器版本为准。
+
+    游戏自己更新（或第三方启动器更新）时本地记录会过期，这里能把它纠正回来。
+    返回 {'latest': 服务器最新版本, 'pending': 待更新文件数, 'version': 真实版本或 None}。
+    """
+    service = GameService(session, product, progress, lambda done, total: None)
+    info = service.request_info(installing=False)
+    pending = service.plan(info, Path(root)).pending()
+    latest = info.get('latest_version')
+    return {'latest': latest, 'pending': len(pending),
+            'version': latest if not pending else None}
+
+
 def move_game(product, base, progress=lambda done, total: None,
               cancel_check=lambda: None, message=lambda text: None):
     """把已安装的游戏整体搬到新的基准目录（装到 <base>/<product>），跨盘可用。
@@ -474,7 +506,11 @@ class GameService:
         pending=plan.pending()
         size=sum(f.size for f in pending if not f.delete)
         self.progress(f"版本 {info['latest_version']} · {len(pending)} 个文件 · {size/1048576:.1f} MiB")
-        if action=='check': return f"版本 {info['latest_version']} · 待更新 {len(pending)} 个文件 · {size/1048576:.1f} MiB"
+        if action=='check':
+            if not pending:
+                # 本地文件与最新清单完全一致：说明游戏已经是这个版本了（可能是游戏自己更新的）
+                record_version(self.product, info['latest_version'], root)
+            return f"版本 {info['latest_version']} · 待更新 {len(pending)} 个文件 · {size/1048576:.1f} MiB"
         self.stopped(root)
         updater.run()
         if plan.pending(): raise DmmError('文件校验未通过')

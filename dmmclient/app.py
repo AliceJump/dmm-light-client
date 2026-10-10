@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path, game_root,
-    installed_record, move_game, official_record, official_records, records,
-    refresh_catalog, save_cover)
+    installed_record, move_game, official_record, official_records, record_version, records,
+    refresh_catalog, save_cover, verify_version)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
@@ -354,12 +354,46 @@ class CoverWorker(QThread):
             pass  # 封面是增强体验；代理不可用时静默跳过，等待下次触发
 
 
+class VersionWorker(QThread):
+    """后台核对已安装游戏的真实版本：本地文件与最新清单一致就以服务器版本为准。
+
+    游戏自己更新（或第三方启动器更新）时本地记录会过期，这里把它纠正回来。
+    清单校验大部分文件只比大小，很快；失败就静默跳过，继续用本地记录。
+    """
+    verified = Signal(str, dict)   # product, {'version','latest','pending'}
+
+    def __init__(self, settings, targets, parent=None):
+        super().__init__(parent)
+        self.settings, self.targets = dict(settings), list(targets)
+
+    def run(self):
+        try:
+            with operation_proxy(self.settings, lambda message: None, lambda: None, data_dir()) as proxy:
+                session = DmmSession(proxy)
+                session.ensure_login()
+                for product, root in self.targets:
+                    try:
+                        result = verify_version(session, product, root)
+                    except Exception:
+                        continue
+                    if result['pending'] == 0 and result['version']:
+                        record_version(product, result['version'], root)
+                    self.verified.emit(product, {'version': result['version'] or '',
+                                                 'latest': result['latest'] or '',
+                                                 'pending': result['pending']})
+        except Exception:
+            pass
+
+
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
         self.worker = None
         self.pending_actions = deque()
+        self.versions = {}          # product -> 后台核对出来的版本信息
+        self.version_worker = None
+        self.version_checked_at = 0.0
         self.cover_worker = None
         self.store_proxy_url = None
         self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
@@ -541,7 +575,7 @@ class Window(QMainWindow):
             if managed: buttons.append(('目录', 'game-dir', False))   # 官方装的不动它的目录
             self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
                 self.library_covers, product, title,
-                f"{origin}已安装 · 版本 {value.get('version', '未知')}", buttons))
+                f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}", buttons))
         self._restore_scroll(self.library_grid, offset)
 
     def repopulate_store(self, keep_scroll=False):
@@ -564,7 +598,7 @@ class Window(QMainWindow):
                 buttons = [('启动', 'game-launch', True), ('更新', 'game-update', False)]
                 if product in records(): buttons.append(('目录', 'game-dir', False))
                 buttons.append(('详情', 'detail-open', False))
-                state = badge + f"已安装 · 版本 {record.get('version', '未知')}"
+                state = badge + f"已安装 · 版本 {record.get('version', '未知')}{self.version_note(product)}"
             else:
                 state = badge + '未安装 · 可全新安装'
                 buttons = [('全新安装', 'game-update', True), ('目录', 'game-dir', False), ('详情', 'detail-open', False)]
@@ -595,6 +629,32 @@ class Window(QMainWindow):
             self.sysproxy.blockSignals(True); self.sysproxy.setChecked(system_proxy_active()); self.sysproxy.blockSignals(False)
         except Exception: pass
         self.kick_covers()
+        self.kick_version_check()
+
+    def version_note(self, product):
+        """版本提示：后台核对出有待更新文件时，说明能更新到哪个版本。"""
+        info = self.versions.get(product)
+        if info and info.get('pending'):
+            return f" · 可更新到 {info['latest']}"
+        return ''
+
+    def kick_version_check(self):
+        """后台核对已安装游戏的真实版本；不打断操作，60 秒内不重复跑。"""
+        if self.version_worker and self.version_worker.isRunning(): return
+        if self.worker and self.worker.isRunning(): return
+        if not self.isVisible(): return
+        if time.monotonic() - self.version_checked_at < 60: return
+        targets = [(product, value['root']) for product, value in
+                   {**official_records(), **records()}.items() if value.get('root')]
+        if not targets: return
+        self.version_checked_at = time.monotonic()
+        self.version_worker = VersionWorker(self.settings, targets)
+        self.version_worker.verified.connect(self.version_arrived)
+        self.version_worker.start()
+
+    def version_arrived(self, product, info):
+        self.versions[product] = info
+        self.repopulate_library(True); self.repopulate_store(True)
 
     def paint_cover(self, label, product):
         path = cover_path(data_dir(), product) if product else None
