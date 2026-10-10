@@ -1,5 +1,6 @@
 import json
 import os
+import time
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 import tempfile
 import unittest
@@ -229,6 +230,42 @@ class ClientTests(unittest.TestCase):
             window = Window()
             self.assertIn('AliceJump', window.account_state.text())
             self.assertEqual(window.account_chip.text(), '账号 51325214 · AliceJump')
+            window.close(); window.deleteLater(); app.processEvents()
+
+    def test_closing_waits_for_background_workers(self):
+        """关窗口必须等后台线程结束：QThread 运行中被回收会让 Qt 直接 abort。"""
+        from PySide6.QtCore import QThread
+        app = QApplication.instance() or QApplication([])
+
+        class Slow(QThread):
+            def run(self): time.sleep(0.4)
+
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None), \
+                patch.object(Window, 'kick_version_check', lambda self: None), \
+                patch.object(Window, 'kick_account_check', lambda self: None):
+            window = Window()
+            slow = Slow(); window.detail_worker = slow; slow.start()
+            self.assertTrue(slow.isRunning())
+            window.close()
+            self.assertFalse(slow.isRunning(), 'closeEvent 应该等后台线程跑完')
+            window.deleteLater(); app.processEvents()
+
+    def test_detail_keeps_the_worker_reference(self):
+        """detail_ready 不能丢引用：信号是队列投递的，run() 可能还在收尾。"""
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None), \
+                patch.object(Window, 'kick_version_check', lambda self: None), \
+                patch.object(Window, 'kick_account_check', lambda self: None):
+            window = Window()
+            sentinel = Mock()
+            window.detail_worker = sentinel
+            window.detail_ready('game1', {'detail': {'title': 'x'}, 'shots': []})
+            self.assertIs(window.detail_worker, sentinel)
+            self.assertEqual(window.detail_data['game1']['title'], 'x')
             window.close(); window.deleteLater(); app.processEvents()
 
     def test_uninstall_is_offered_on_managed_cards(self):

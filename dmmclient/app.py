@@ -1486,7 +1486,9 @@ class Window(QMainWindow):
         self.detail_worker.start()
 
     def detail_ready(self, product, payload):
-        self.detail_loading = None; self.detail_worker = None
+        # 这里不能把 self.detail_worker 置空：信号是队列投递的，run() 可能还在收尾，
+        # 丢掉最后一个引用会让 QThread 被 GC 掉（运行中被回收 = Qt abort）。
+        self.detail_loading = None
         if payload.get('detail'): self.detail_data[product] = payload['detail']
         if payload.get('shots'): self.detail_shots[product] = payload['shots']
         if product == getattr(self, 'detail_product', None): self.snap_fill(product)
@@ -1860,14 +1862,21 @@ class Window(QMainWindow):
         self.pause.setEnabled(False); self.bar.setRange(0,100); self.bar.hide()
         self.hide_busy(); self.node_text.clear(); self.refresh()
 
+    def background_workers(self):
+        return (self.cover_worker, self.version_worker, self.account_worker, self.detail_worker)
+
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
-            self.cancel(); self.status.setText('请等待当前操作停止后再关闭客户端'); event.ignore()
-        else:
-            if self.cover_worker and self.cover_worker.isRunning(): self.cover_worker.wait(3000)
-            restore_system_proxy()
-            HUB.shutdown()
-            event.accept()
+            self.cancel(); self.status.setText('请等待当前操作停止后再关闭客户端'); event.ignore(); return
+        # 后台线程必须等它自己结束：QThread 还在跑就被回收，Qt 会直接 abort，
+        # 连 Python traceback 都不留（日志里只剩一行「启动」就是这么来的）。
+        deadline = time.monotonic() + 8
+        for worker in self.background_workers():
+            if worker is None or not worker.isRunning(): continue
+            worker.wait(max(200, int((deadline - time.monotonic()) * 1000)))
+        restore_system_proxy()
+        HUB.shutdown()
+        event.accept()
 
 
 def setup_logging():
@@ -1879,6 +1888,11 @@ def setup_logging():
     if sys.stdout is None or sys.stderr is None:
         sys.stdout = sys.stderr = stream
     faulthandler.enable(stream)
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+        qInstallMessageHandler(lambda mode, context, message: stream.write(f'[qt] {message}\n'))
+    except Exception:
+        pass
     sys.excepthook = lambda t, v, tb: stream.write(''.join(traceback.format_exception(t, v, tb)))
     threading.excepthook = lambda args: stream.write(
         ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
