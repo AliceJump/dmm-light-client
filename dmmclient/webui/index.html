@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>DMM Light · 独立客户端</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><div class="mark">D</div><div><b>DMM Light</b><span>独立客户端</span></div></div>
+    <nav class="nav">
+      <a class="on" data-page="lib"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>我的车库<span class="count" id="libcount"></span></a>
+      <a data-page="store"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>发现游戏<span class="count" id="storecount"></span></a>
+      <a data-page="account"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>账号</a>
+      <a data-page="network"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>网络</a>
+    </nav>
+    <div class="side-foot">
+      <div class="chip"><span class="dot" id="acct-dot"></span><span class="txt" id="acct-chip">未登录</span></div>
+      <div class="chip"><span class="dot" id="node-dot"></span><span class="txt" id="node-chip">节点未就绪</span></div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <h2 id="page-title">我的车库</h2><span class="sub" id="page-sub"></span>
+      <div class="search hidden" id="searchbox">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+        <input id="search" placeholder="搜索游戏名…">
+      </div>
+      <button class="btn" id="refresh">刷新</button>
+    </header>
+
+    <div class="scroll" id="scroll">
+      <!-- 车库 -->
+      <section id="page-lib">
+        <div id="hero"></div>
+        <div id="lib-view"></div>
+        <div id="detail-view" class="hidden"></div>
+      </section>
+      <!-- 发现 -->
+      <section id="page-store" class="hidden">
+        <div class="filters" id="filters"></div>
+        <div class="sec"><h4 id="store-sec-title">全部游戏</h4><span class="n" id="store-count2"></span></div>
+        <div class="grid" id="store-grid"></div>
+      </section>
+      <!-- 账号 -->
+      <section id="page-account" class="hidden"></section>
+      <!-- 网络 -->
+      <section id="page-network" class="hidden"></section>
+    </div>
+
+    <div id="logbox" class="hidden"></div>
+    <footer class="status">
+      <div class="bar" id="bar"><i></i></div>
+      <span class="msg" id="status">就绪</span>
+      <div class="sp">
+        <button class="btn" id="pause">暂停</button>
+        <button class="btn" id="logbtn">日志</button>
+      </div>
+    </footer>
+  </div>
+</div>
+<div id="busy" class="hidden"><div class="box"><div class="spin"></div><span id="busytext"></span></div></div>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -21,3 +21,6 @@ build/
 Thumbs.db
 .DS_Store
 .workbuddy/
+
+# WorkBuddy 本地数据
+.workbuddy-ai/

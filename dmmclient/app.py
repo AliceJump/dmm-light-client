@@ -1911,14 +1911,17 @@ def setup_logging():
 def main():
     log = setup_logging()
     try:
-        app = QApplication(sys.argv)
-        window = Window(); window.show()
-        try:
-            # 跟随系统明暗：系统切换时立刻换肤，不用重启
-            app.styleHints().colorSchemeChanged.connect(lambda _: window.apply_theme(system_theme()))
-        except AttributeError:
-            pass
-        return app.exec()
+        if '--native' in sys.argv:      # 原生 Qt 控件版保留为回退入口
+            app = QApplication(sys.argv)
+            window = Window(); window.show()
+            try:
+                # 跟随系统明暗：系统切换时立刻换肤，不用重启
+                app.styleHints().colorSchemeChanged.connect(lambda _: window.apply_theme(system_theme()))
+            except AttributeError:
+                pass
+            return app.exec()
+        from .webapp import run_webview    # 导入前不得碰 QtWebEngine（见 webapp.bootstrap_proxy）
+        return run_webview()
     except BaseException:
         log.write(traceback.format_exc())
         raise
