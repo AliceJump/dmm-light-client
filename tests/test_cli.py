@@ -41,4 +41,28 @@ class CliTests(unittest.TestCase):
             self.assertEqual(main(['list', '--json']), 0)
 
 
+    def test_uninstall_previews_before_it_deletes(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as target, \
+                patch.dict(os.environ, {'LOCALAPPDATA': folder}):
+            data_dir().mkdir(parents=True, exist_ok=True)
+            root = Path(target) / 'game1'; root.mkdir(); (root / 'game.exe').write_bytes(b'MZ')
+            (data_dir() / 'games.json').write_text(
+                json.dumps({'game1': {'root': str(root), 'version': '1'}}), encoding='utf-8')
+            self.assertEqual(main(['uninstall', 'game1']), 0)
+            self.assertTrue(root.exists(), '不加 --yes 不能删文件')
+            self.assertEqual(main(['uninstall', 'game1', '--yes']), 0)
+            self.assertFalse(root.exists())
+
+    def test_uninstall_keep_leaves_the_files(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as target, \
+                patch.dict(os.environ, {'LOCALAPPDATA': folder}):
+            data_dir().mkdir(parents=True, exist_ok=True)
+            root = Path(target) / 'game1'; root.mkdir(); (root / 'game.exe').write_bytes(b'MZ')
+            (data_dir() / 'games.json').write_text(
+                json.dumps({'game1': {'root': str(root), 'version': '1'}}), encoding='utf-8')
+            self.assertEqual(main(['uninstall', 'game1', '--keep']), 0)
+            self.assertTrue(root.exists())
+            self.assertEqual(json.loads((data_dir() / 'games.json').read_text(encoding='utf-8')), {})
+
+
 if __name__ == '__main__': unittest.main()

@@ -182,6 +182,22 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(game_install_root('priconner'),
                              Path(folder) / 'DmmLightClient' / 'games' / 'priconner')
 
+    def test_uninstall_is_offered_on_managed_cards(self):
+        """本客户端装的卡片要有「卸载」；官方 Player 装的不给（不动官方数据）。"""
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None), \
+                patch.object(Window, 'kick_version_check', lambda self: None):
+            data_dir().mkdir(parents=True, exist_ok=True)
+            (data_dir() / 'games.json').write_text(json.dumps(
+                {'priconner': {'root': 'D:/games/priconner', 'version': '1'}}), encoding='utf-8')
+            window = Window()
+            labels = [button.text() for button in window.library_buttons]
+            self.assertIn('卸载', labels)
+            self.assertIn('目录', labels)
+            window.close(); window.deleteLater(); app.processEvents()
+
     def test_refresh_keeps_card_wall_scroll_position(self):
         """安装完成后的刷新不应把卡片墙弹回顶部（clear() 会把滚动条归零）。"""
         import json

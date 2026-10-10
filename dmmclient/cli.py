@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .backend.accounts import AccountStore
 from .backend.games import (GameService, catalog, checked_product, game_root, move_game,
-                            official_records, records, refresh_catalog)
+                            official_records, records, refresh_catalog, uninstall_game)
 from .backend.session import (DmmError, DmmSession, LoginRequired, data_dir, valid_proxy)
 from .backend.settings import (game_install_root, load_settings, remember_install_base,
                                save_settings)
@@ -146,6 +146,29 @@ def cmd_move(args):
     return 0
 
 
+def cmd_uninstall(args):
+    """默认只预览要删什么；加 --yes 才真的删。"""
+    checked_product(args.product)
+    record = records().get(args.product)
+    if not record or not record.get('root'):
+        say('该游戏不是由本客户端安装的，无法卸载')
+        return 1
+    root = Path(record['root'])
+    if args.keep:
+        uninstall_game(args.product, keep_files=True)
+        say(f'已移除安装记录，游戏文件保留在 {root}')
+        return 0
+    if not args.yes:
+        say(f'将删除：{root}')
+        say('这是本客户端安装的目录，里面的文件会全部消失且无法恢复。')
+        say(f'确认请加 --yes：dmmcli uninstall {args.product} --yes')
+        say(f'只想移除记录、保留文件：dmmcli uninstall {args.product} --keep')
+        return 0
+    result = uninstall_game(args.product, keep_files=False)
+    say(f"已卸载，删除 {result['files']} 个文件 · {result['bytes'] / 1048576:.1f} MiB")
+    return 0
+
+
 def cmd_dir(args):
     checked_product(args.product)
     if args.set:
@@ -241,6 +264,12 @@ def build_parser():
     p.add_argument('product')
     p.add_argument('--dir', required=True, help='新的基准目录，游戏会移到 <dir>/<product>')
     p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser('uninstall', help='卸载本客户端安装的游戏')
+    p.add_argument('product')
+    p.add_argument('--keep', action='store_true', help='只移除安装记录，保留游戏文件')
+    p.add_argument('--yes', action='store_true', help='确认真的删除文件（不加只预览）')
+    p.set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser('dir', help='查看或设置游戏的安装位置')
     p.add_argument('product')

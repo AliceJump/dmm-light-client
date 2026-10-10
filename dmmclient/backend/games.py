@@ -238,6 +238,65 @@ def verify_version(session, product, root, progress=lambda message: None):
             'version': latest if not pending else None}
 
 
+def _safe_to_remove(root):
+    """只允许删游戏自己的目录：不碰盘符根、用户主目录，也不碰数据目录所在的位置。"""
+    try:
+        root = Path(root).resolve()
+    except OSError:
+        return False
+    if not root.is_dir() or root.parent == root:
+        return False
+    try:
+        if root == Path.home().resolve(): return False
+        if data_dir().resolve().is_relative_to(root): return False
+    except OSError:
+        return False
+    return True
+
+
+def uninstall_game(product, keep_files=False, progress=lambda done, total: None,
+                   cancel_check=lambda: None, message=lambda text: None):
+    """卸载本客户端安装的游戏；keep_files=True 时只移除安装记录，文件留着。
+
+    只删记录里那一个目录，先删文件再删空目录；每一步都检查取消。
+    返回 {'files': 删除的文件数, 'bytes': 释放的字节数}。
+    """
+    value = records()
+    record = value.get(product)
+    if not record or not record.get('root'):
+        raise DmmError('该游戏不是由本客户端安装的，无法卸载')
+    root = Path(record['root']).resolve()
+    if game_running(root):
+        raise DmmError('该游戏正在运行，请先关闭游戏再卸载')
+    removed = freed = 0
+    if not keep_files:
+        if not _safe_to_remove(root):
+            raise DmmError(f'安装目录不安全，已拒绝删除：{root}')
+        targets = [path for path in root.rglob('*') if path.is_file()]
+        total = sum(path.stat().st_size for path in targets)
+        message(f'删除 {len(targets)} 个文件 · {total / 1048576:.1f} MiB')
+        done = 0
+        for path in targets:
+            cancel_check()
+            try:
+                size = path.stat().st_size
+                path.unlink(); removed += 1; freed += size
+            except OSError:
+                continue
+            done += size
+            progress(done, total or 1)
+        cancel_check()
+        for folder in sorted((p for p in root.rglob('*') if p.is_dir()),
+                             key=lambda p: len(p.parts), reverse=True):
+            try: folder.rmdir()
+            except OSError: pass
+        try: root.rmdir()
+        except OSError: pass
+    value.pop(product, None)
+    atomic_write(data_dir() / 'games.json', json.dumps(value, ensure_ascii=False).encode())
+    return {'files': removed, 'bytes': freed}
+
+
 def move_game(product, base, progress=lambda done, total: None,
               cancel_check=lambda: None, message=lambda text: None):
     """把已安装的游戏整体搬到新的基准目录（装到 <base>/<product>），跨盘可用。

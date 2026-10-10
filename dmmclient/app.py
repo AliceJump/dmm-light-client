@@ -14,18 +14,19 @@ from collections import deque
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QEvent, QObject, QPointF, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSize, Qt,
+    QThread, QTimer, QUrl, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QMouseEvent, QPainter,
-    QPainterPath, QPixmap)
+    QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QProgressBar, QPushButton, QScroller, QScrollerProperties, QScrollArea, QStackedWidget,
-    QTextEdit, QVBoxLayout, QWidget)
+    QMessageBox, QProgressBar, QPushButton, QScroller, QScrollerProperties, QScrollArea,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path, game_root,
     installed_record, move_game, official_record, official_records, record_version, records,
-    refresh_catalog, save_cover, verify_version)
+    refresh_catalog, save_cover, uninstall_game, verify_version)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
@@ -41,7 +42,7 @@ def divider():
     return line
 
 
-def rounded_pixmap(pixmap, radius=10):
+def rounded_pixmap(pixmap, radius=16):
     result = QPixmap(pixmap.size()); result.fill(Qt.transparent)
     painter = QPainter(result); painter.setRenderHint(QPainter.SmoothPixmapTransform)
     path = QPainterPath(); path.addRoundedRect(0, 0, result.width(), result.height(), radius, radius)
@@ -249,6 +250,13 @@ class Worker(QThread):
                     target = move_game(self.product, self.extra, self.progress, self.check_cancel, self.message.emit)
                     self.finished_ok.emit(f'游戏目录已移动到 {target}')
                     return
+                if self.action == 'game-uninstall':
+                    keep = self.extra == 'keep'
+                    result = uninstall_game(self.product, keep, self.progress, self.check_cancel, self.message.emit)
+                    self.finished_ok.emit('已移除安装记录，游戏文件保留' if keep else
+                                          f"已卸载，删除 {result['files']} 个文件 · "
+                                          f"{result['bytes'] / 1048576:.1f} MiB")
+                    return
                 with operation_proxy(self.settings, self.message.emit, self.check_cancel, root) as proxy:
                     if self.action == 'test':
                         with requests.Session() as http:
@@ -396,7 +404,7 @@ def soft_backdrop(pixmap, width, height):
     return tiny.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
 
-def square_cover(pixmap, size, radius=12):
+def square_cover(pixmap, size, radius=16):
     """裁成正方形并切圆角：DMM 封面本身就是 1:1，这里只是兜底。"""
     scaled = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
     left = max(0, (scaled.width() - size) // 2)
@@ -447,7 +455,7 @@ class HeroBanner(QFrame):
 
     def paintEvent(self, event):
         painter = QPainter(self); painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        path = QPainterPath(); path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
+        path = QPainterPath(); path.addRoundedRect(0, 0, self.width(), self.height(), 20, 20)
         painter.setClipPath(path); painter.fillRect(self.rect(), self._veil)
         if not self._backdrop.isNull():
             painter.drawPixmap(0, 0, self._backdrop)
@@ -457,8 +465,102 @@ class HeroBanner(QFrame):
         gradient.setColorAt(1.0, QColor(self._veil.red(), self._veil.green(), self._veil.blue(), 96))
         painter.fillRect(self.rect(), gradient)
         painter.setPen(QColor(self._edge)); painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, 16, 16)
+        painter.drawRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, 20, 20)
         painter.end()
+
+
+class Spinner(QWidget):
+    """转圈：底色圆环 + 一段高亮弧，定时旋转。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(34, 34)
+        self.angle = 0
+        self.track = QColor('#2b323d'); self.accent = QColor('#5b7cfa')
+        self.timer = QTimer(self); self.timer.timeout.connect(self._tick)
+
+    def set_colors(self, track, accent):
+        self.track = QColor(track); self.accent = QColor(accent); self.update()
+
+    def start(self):
+        if not self.timer.isActive(): self.timer.start(16)
+
+    def stop(self):
+        self.timer.stop()
+
+    def hideEvent(self, event):
+        super().hideEvent(event); self.stop()
+
+    def showEvent(self, event):
+        super().showEvent(event); self.start()
+
+    def _tick(self):
+        self.angle = (self.angle + 7) % 360; self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self); painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(3, 3, self.width() - 6, self.height() - 6)
+        pen = QPen(self.track); pen.setWidth(3); pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen); painter.drawArc(rect, 0, 360 * 16)
+        pen.setColor(self.accent); painter.setPen(pen)
+        painter.drawArc(rect, -self.angle * 16, 110 * 16)
+        painter.end()
+
+
+class BusyOverlay(QWidget):
+    """盖在内容上的实时遮罩：半透明底 + 转圈 + 文案，切换/刷新时用。"""
+
+    def __init__(self, parent, colors):
+        super().__init__(parent)
+        self.setObjectName('busy')
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.scrim = QColor(colors['bg']); self.scrim.setAlpha(214)
+        box = QVBoxLayout(self); box.setAlignment(Qt.AlignCenter); box.setSpacing(12)
+        self.spinner = Spinner(self)
+        self.spinner.set_colors(colors['surface3'], colors['accent'])
+        self.label = QLabel(''); self.label.setObjectName('busyload')
+        self.label.setAlignment(Qt.AlignCenter)
+        box.addWidget(self.spinner, 0, Qt.AlignHCenter)
+        box.addWidget(self.label)
+        self.hide()
+
+    def set_theme(self, colors):
+        self.scrim = QColor(colors['bg']); self.scrim.setAlpha(214)
+        self.spinner.set_colors(colors['surface3'], colors['accent'])
+        self.update()
+
+    def set_text(self, text):
+        self.label.setText(text)
+
+    def paintEvent(self, event):
+        painter = QPainter(self); painter.fillRect(self.rect(), self.scrim); painter.end()
+
+
+class CrossFade(QWidget):
+    """把切换前的画面盖在新界面上淡出——换肤、换页都靠它做过场。
+
+    直接用 QPainter.setOpacity 画，比 QGraphicsOpacityEffect 快得多，
+    淡出期间还会挡住鼠标，避免动画没结束就点到东西。
+    """
+
+    def __init__(self, parent, pixmap, duration=220):
+        super().__init__(parent)
+        self.pixmap = pixmap; self.alpha = 1.0
+        self.setGeometry(parent.rect()); self.raise_(); self.show()
+        self.animation = QVariantAnimation(self)
+        self.animation.setDuration(duration)
+        self.animation.setStartValue(1.0); self.animation.setEndValue(0.0)
+        self.animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.animation.valueChanged.connect(self._step)
+        self.animation.finished.connect(self.deleteLater)
+        self.animation.start(QVariantAnimation.DeleteWhenStopped)
+
+    def _step(self, value):
+        self.alpha = float(value); self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self); painter.setOpacity(self.alpha)
+        painter.drawPixmap(0, 0, self.pixmap); painter.end()
 
 
 class Window(QMainWindow):
@@ -481,6 +583,7 @@ class Window(QMainWindow):
         self.library_covers = {}   # product -> [QLabel]，随网格重建
         self.store_covers = {}
         self.cover_tried = set()
+        self.busy = None            # 内容区遮罩，按需创建
         self.theme = system_theme()
         self.setWindowTitle('DMM Light · 独立客户端')
         self.setWindowIcon(app_icon())
@@ -508,12 +611,30 @@ class Window(QMainWindow):
 
     # ---------- 主题 ----------
 
-    def apply_theme(self, theme):
-        """跟随系统切换明暗；界面用的是全局样式表，改一次就够。"""
+    def apply_theme(self, theme, animate=True):
+        """跟随系统切换明暗；切换时把旧画面盖住淡出，不秒切。"""
+        snapshot = self.grab() if (animate and self.isVisible()) else None
         self.theme = theme
         application = QApplication.instance()
         if application is not None: application.setStyleSheet(build_style(theme))
         self.hero.set_theme(palette(theme))
+        if self.busy is not None: self.busy.set_theme(palette(theme))
+        if snapshot is not None and not snapshot.isNull(): CrossFade(self, snapshot, 260)
+
+    def show_busy(self, text):
+        """内容区盖上遮罩（半透明底 + 转圈 + 文案），用于刷新目录这类慢操作。"""
+        if self.busy is None: self.busy = BusyOverlay(self.tabs, palette(self.theme))
+        self.busy.set_text(text)
+        self.busy.setGeometry(self.tabs.rect())
+        self.busy.show(); self.busy.raise_()
+
+    def hide_busy(self):
+        if self.busy is not None: self.busy.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.busy is not None and self.busy.isVisible():
+            self.busy.setGeometry(self.tabs.rect())
 
     # ---------- 骨架 ----------
 
@@ -572,7 +693,9 @@ class Window(QMainWindow):
         column.addLayout(row)
         return wrap
 
-    def show_page(self, index):
+    def show_page(self, index, animate=True):
+        changed = self.tabs.currentIndex() != index
+        snapshot = self.tabs.grab() if (changed and animate and self.isVisible()) else None
         self.tabs.setCurrentIndex(index)
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
@@ -580,6 +703,7 @@ class Window(QMainWindow):
         self.page_title.setText(title); self.page_sub.setText(subtitle)
         self.search.setVisible(index == 1)
         self.top_button.setText('刷新游戏列表' if index == 1 else '刷新')
+        if snapshot is not None and not snapshot.isNull(): CrossFade(self.tabs, snapshot, 180)
 
     def top_action(self):
         if self.tabs.currentIndex() == 1:
@@ -690,6 +814,7 @@ class Window(QMainWindow):
             for text, action, _ in secondary:
                 button = QPushButton(text); button.setObjectName('link')
                 button.setCursor(Qt.PointingHandCursor)
+                if action == 'game-uninstall': button.setProperty('danger', True)
                 button.clicked.connect(lambda _, a=action, p=product: self.run_action(a, p))
                 row.addWidget(button); buttons.append(button)
             box.addLayout(row)
@@ -753,6 +878,7 @@ class Window(QMainWindow):
 
     def repopulate_library(self, keep_scroll=True):
         offset = self.library_grid.verticalScrollBar().value() if keep_scroll else 0
+        self.library_grid.setUpdatesEnabled(False)   # 重建期间别重绘，否则会先闪一下空白
         self.library_grid.clear(); self.library_buttons = []; self.library_covers = {}
         installed = {**official_records(), **records()}
         try:
@@ -771,14 +897,16 @@ class Window(QMainWindow):
             managed = product in records()
             origin = '' if managed else '官方 Player 安装 · '
             buttons = [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False)]
-            if managed: buttons.append(('目录', 'game-dir', False))   # 官方装的不动它的目录
+            if managed: buttons += [('目录', 'game-dir', False), ('卸载', 'game-uninstall', False)]
             self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
                 self.library_covers, product, title,
                 f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}", buttons))
         self._restore_scroll(self.library_grid, offset)
+        self.library_grid.setUpdatesEnabled(True)
 
     def repopulate_store(self, keep_scroll=False):
         offset = self.store_grid.verticalScrollBar().value() if keep_scroll else 0
+        self.store_grid.setUpdatesEnabled(False)
         self.store_grid.clear(); self.store_buttons = []; self.store_covers = {}
         installed = {**official_records(), **records()}
         titles = self.known_titles()
@@ -795,7 +923,7 @@ class Window(QMainWindow):
             badge = 'Fanza R18 · ' if product in adult else ''
             if record:
                 buttons = [('启动', 'game-launch', True), ('更新', 'game-update', False)]
-                if product in records(): buttons.append(('目录', 'game-dir', False))
+                if product in records(): buttons += [('目录', 'game-dir', False), ('卸载', 'game-uninstall', False)]
                 buttons.append(('详情', 'detail-open', False))
                 state = badge + f"已安装 · 版本 {record.get('version', '未知')}{self.version_note(product)}"
             else:
@@ -804,6 +932,7 @@ class Window(QMainWindow):
             self.add_card(self.store_grid, self.make_card(self.store_grid, self.store_buttons,
                 self.store_covers, product, title, state, buttons))
         self._restore_scroll(self.store_grid, offset)
+        self.store_grid.setUpdatesEnabled(True)
 
     # ---------- 刷新与封面 ----------
 
@@ -1088,6 +1217,10 @@ class Window(QMainWindow):
                 self.refresh(); self.report('游戏目录已保存'); return
             if action == 'game-dir':
                 self.choose_game_directory(product); return
+            if action == 'game-uninstall':
+                choice = self.confirm_uninstall(product)
+                if choice is None: return
+                self.dispatch('game-uninstall', product, choice); return
             if action in {'launch', 'game-launch'}: self.remember_launch(product)
             self.settings = {'proxy': valid_proxy(self.proxy.text().strip()), NODE_ENABLED_KEY: self.mode.currentIndex()==0}
             atomic_write(data_dir()/'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
@@ -1122,6 +1255,28 @@ class Window(QMainWindow):
             self.report(f'已排入队列（{len(self.pending_actions)} 个待执行），当前操作结束后自动开始')
             return
         self.start_operation(request)
+
+    def confirm_uninstall(self, product):
+        """卸载前二次确认：默认「只移除记录」，彻底删除要单独点。"""
+        record = records().get(product)
+        if not record:
+            self.report('该游戏不是由本客户端安装的，无法卸载'); return None
+        root = Path(record['root'])
+        box = QMessageBox(self)
+        box.setWindowTitle('卸载游戏')
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"要卸载「{self.known_titles().get(product, product)}」吗？")
+        box.setInformativeText(f'安装目录：{root}\n\n'
+                               '「只移除记录」会保留全部游戏文件，下次启动会重新识别；\n'
+                               '「彻底删除」会删除上面这个目录里的所有文件，无法恢复。')
+        purge = box.addButton('彻底删除（含文件）', QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton('只移除记录，保留文件', QMessageBox.ButtonRole.ActionRole)
+        box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is purge: return 'purge'
+        if clicked is keep: return 'keep'
+        return None
 
     def pick_install_base(self, product):
         """弹目录选择框，返回用户选的基准目录（游戏会装到 <基准>/<product>）。"""
@@ -1164,6 +1319,7 @@ class Window(QMainWindow):
 
     def start_operation(self, request):
         action, settings, number, name, node_text, product, extra = request
+        if action == 'refresh-catalog': self.show_busy('正在刷新游戏列表…')
         self.worker = Worker(action, settings, number, name, node_text, product, extra, self)
         self.worker.message.connect(self.report)
         self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
@@ -1186,7 +1342,7 @@ class Window(QMainWindow):
             self.start_operation(self.pending_actions.popleft())
             return
         self.pause.setEnabled(False); self.bar.setRange(0,100); self.bar.hide()
-        self.node_text.clear(); self.refresh()
+        self.hide_busy(); self.node_text.clear(); self.refresh()
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

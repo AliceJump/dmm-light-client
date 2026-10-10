@@ -208,4 +208,61 @@ class VersionTests(unittest.TestCase):
             self.assertEqual(result['latest'], '3.4.1')
 
 
+class UninstallTests(unittest.TestCase):
+    """卸载：默认删文件 + 记录；可只删记录保留文件；不安全或运行中一律拒绝。"""
+
+    def _tree(self, root):
+        (root / 'data').mkdir(parents=True)
+        (root / 'game.exe').write_bytes(b'MZ')
+        (root / 'data' / 'a.bin').write_bytes(b'x' * 32)
+
+    def _run(self, root, folder, keep=False):
+        from dmmclient.backend.games import uninstall_game
+        written = {}
+        with patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+             patch('dmmclient.backend.games.records', return_value={'game1': {'root': str(root)}}), \
+             patch('dmmclient.backend.games.atomic_write',
+                   side_effect=lambda path, blob: written.update({path.name: json.loads(blob)})), \
+             patch('dmmclient.backend.games.game_running', return_value=False):
+            return uninstall_game('game1', keep_files=keep), written
+
+    def test_uninstall_deletes_files_and_drops_the_record(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as data:
+            root = Path(folder) / 'game1'; self._tree(root)
+            result, written = self._run(root, data)
+            self.assertFalse(root.exists(), '游戏目录应被删除')
+            self.assertEqual(result['files'], 2)
+            self.assertEqual(result['bytes'], 34)
+            self.assertEqual(written['games.json'], {}, '安装记录应被移除')
+
+    def test_keep_files_only_drops_the_record(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as data:
+            root = Path(folder) / 'game1'; self._tree(root)
+            result, written = self._run(root, data, keep=True)
+            self.assertTrue(root.exists(), '保留文件时目录必须还在')
+            self.assertTrue((root / 'game.exe').is_file())
+            self.assertEqual(result['files'], 0)
+            self.assertEqual(written['games.json'], {})
+
+    def test_refuses_while_the_game_runs(self):
+        from dmmclient.backend.games import uninstall_game
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as data:
+            root = Path(folder) / 'game1'; self._tree(root)
+            with patch.dict(os.environ, {'LOCALAPPDATA': data}), \
+                 patch('dmmclient.backend.games.records', return_value={'game1': {'root': str(root)}}), \
+                 patch('dmmclient.backend.games.game_running', return_value=True):
+                with self.assertRaises(DmmError): uninstall_game('game1')
+            self.assertTrue(root.exists())
+
+    def test_refuses_a_root_that_would_take_the_data_dir_with_it(self):
+        from dmmclient.backend.games import uninstall_game
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)          # LOCALAPPDATA 本身，数据目录就在它下面
+            with patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                 patch('dmmclient.backend.games.records', return_value={'game1': {'root': str(root)}}), \
+                 patch('dmmclient.backend.games.game_running', return_value=False):
+                with self.assertRaises(DmmError): uninstall_game('game1')
+            self.assertTrue(root.exists(), '不安全的目标必须原样保留')
+
+
 if __name__=='__main__': unittest.main()
