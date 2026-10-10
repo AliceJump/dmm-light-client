@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -285,6 +286,18 @@ class DmmSession:
             self.accept_auth(data["access_token_info"])
         self.cancel_check()
         return data
+
+    def user_profile(self):
+        """当前登录账号的可读信息，用来给账号起名（DMM GAMES ID + 昵称）。"""
+        data = self.request("/v5/userinfo", {"user_os": "win"})
+        if not isinstance(data, dict):
+            raise DmmError("DMM 没有返回账号信息")
+        profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+        number = str(profile.get("dmm_games_id") or data.get("open_id") or "").strip()
+        name = str(profile.get("nickname") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", number):
+            raise DmmError("DMM 没有返回可用的账号编号")
+        return {"number": number, "name": name[:80]}
 
     def accept_auth(self, data):
         if not isinstance(data, dict) or not isinstance(data.get("access_token"), str) or not data["access_token"]:

@@ -189,7 +189,12 @@ def cmd_accounts(args):
         return 0
     value = store.read()
     if not value['accounts']:
-        say('（没有保存的账号）')
+        # 登录过但没保存过账号时别只说"没有"，把当前登录态说清楚
+        if (data_dir() / 'session.dpapi').exists():
+            say('当前已登录，但还没有保存成账号。')
+            say('用「保存当前账号」建档，或直接跑一次 install/launch，客户端会自动建档。')
+        else:
+            say('（没有保存的账号，当前也未登录）')
         return 0
     for account in value['accounts']:
         mark = '*' if account['key'] == value['active'] else ' '

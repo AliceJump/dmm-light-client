@@ -182,6 +182,55 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(game_install_root('priconner'),
                              Path(folder) / 'DmmLightClient' / 'games' / 'priconner')
 
+    def test_user_profile_uses_games_id_and_nickname(self):
+        from dmmclient.backend.session import DmmSession
+        session = DmmSession.__new__(DmmSession)
+        session.request = Mock(return_value={'profile': {'dmm_games_id': '51325214', 'nickname': 'AliceJump'}})
+        self.assertEqual(DmmSession.user_profile(session), {'number': '51325214', 'name': 'AliceJump'})
+
+    def test_user_profile_falls_back_to_open_id(self):
+        from dmmclient.backend.session import DmmSession
+        session = DmmSession.__new__(DmmSession)
+        session.request = Mock(return_value={'open_id': '8lBuKFzgWgRgYD0L'})
+        self.assertEqual(DmmSession.user_profile(session), {'number': '8lBuKFzgWgRgYD0L', 'name': ''})
+
+    def test_user_profile_rejects_an_unusable_id(self):
+        from dmmclient.backend.session import DmmSession
+        session = DmmSession.__new__(DmmSession)
+        session.request = Mock(return_value={'profile': {'dmm_games_id': '有中文 和空格'}})
+        with self.assertRaises(DmmError): DmmSession.user_profile(session)
+
+    def test_account_page_explains_an_unsaved_login(self):
+        """登录过但没保存账号时，页面要说清楚，而不是只显示一个空列表。"""
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None), \
+                patch.object(Window, 'kick_version_check', lambda self: None), \
+                patch.object(Window, 'kick_account_check', lambda self: None):
+            data_dir().mkdir(parents=True, exist_ok=True)
+            (data_dir() / 'session.dpapi').write_bytes(b'x')      # 有登录态，但没有账号记录
+            window = Window()
+            self.assertIn('自动建档', window.account_state.text())
+            self.assertEqual(window.accounts.count(), 0)
+            window.close(); window.deleteLater(); app.processEvents()
+
+    def test_account_page_says_which_account_is_active(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}), \
+                patch.object(DmmHelper, 'installed_game', return_value=(Path(folder), '1')), \
+                patch.object(Window, 'kick_covers', lambda self: None), \
+                patch.object(Window, 'kick_version_check', lambda self: None), \
+                patch.object(Window, 'kick_account_check', lambda self: None):
+            data_dir().mkdir(parents=True, exist_ok=True)
+            (data_dir() / 'accounts.json').write_text(json.dumps({
+                'active': 'a' * 32,
+                'accounts': [{'number': '51325214', 'name': 'AliceJump', 'key': 'a' * 32}]}), encoding='utf-8')
+            window = Window()
+            self.assertIn('AliceJump', window.account_state.text())
+            self.assertEqual(window.account_chip.text(), '账号 51325214 · AliceJump')
+            window.close(); window.deleteLater(); app.processEvents()
+
     def test_uninstall_is_offered_on_managed_cards(self):
         """本客户端装的卡片要有「卸载」；官方 Player 装的不给（不动官方数据）。"""
         app = QApplication.instance() or QApplication([])

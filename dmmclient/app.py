@@ -281,10 +281,10 @@ class Worker(QThread):
                         result = '账号登录并保存完成'
                     elif self.action == 'import-login':
                         import_login(helper)
-                        result = '现有 DMM 登录态已导入，请填写编号保存账号'
+                        result = self.auto_save_account(accounts, helper) or '现有 DMM 登录态已导入'
                     elif self.action == 'login':
                         browser_login(helper, self.message.emit)
-                        result = '登录完成'
+                        result = self.auto_save_account(accounts, helper) or '登录完成'
                     else:
                         try:
                             result = self.game_action(helper)
@@ -299,6 +299,17 @@ class Worker(QThread):
         except Exception as error:
             log_error(f'操作异常 action={self.action} product={self.product or "-"}: {traceback.format_exc()}')
             self.failed.emit(f'操作未完成（{type(error).__name__}）；敏感内容已隐藏')
+
+    def auto_save_account(self, accounts, helper):
+        """登录/导入成功后一个账号都没存时，自动建一条 —— 否则账号页永远是空的。"""
+        if accounts.read()['accounts']: return ''
+        try:
+            profile = helper.session.user_profile()
+        except Exception:
+            return ''
+        number = profile['number']; name = profile['name'] or f'账号 {number}'
+        accounts.save_current(number, name, new=True)
+        return f'已自动保存账号：{name}（{number}）；想改名就填同样编号再点「保存当前账号」'
 
     def fetch_covers(self, helper):
         products = {'gakumas'} | set(SUPPORTED) | set(records())
@@ -563,6 +574,39 @@ class CrossFade(QWidget):
         painter.drawPixmap(0, 0, self.pixmap); painter.end()
 
 
+class AccountWorker(QThread):
+    """后台确认当前登录并自动建档。
+
+    登录本身只写"当前会话"，账号列表要手动「保存当前账号」才会有条目 ——
+    结果就是登录过的人打开账号页一片空白。这里发现「有登录态但一个账号都没存」
+    时，用 /v5/userinfo 的 DMM GAMES ID 与昵称自动建一条。
+    """
+    ready = Signal(dict)   # {'profile': {...}, 'registered': bool}
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = dict(settings)
+
+    def run(self):
+        result = {'profile': None, 'registered': False}
+        try:
+            store = AccountStore(data_dir())
+            if store.read()['accounts'] or not (data_dir() / 'session.dpapi').exists():
+                self.ready.emit(result); return
+            with operation_proxy(self.settings, lambda message: None, lambda: None, data_dir()) as proxy:
+                session = DmmSession(proxy)
+                session.ensure_login()
+                profile = session.user_profile()
+            number = profile['number']
+            name = profile['name'] or f'账号 {number}'
+            with helper_lock(data_dir()):
+                store.save_current(number, name, new=True)
+            result.update({'profile': {'number': number, 'name': name}, 'registered': True})
+        except Exception:
+            pass          # 建档只是补救，失败不影响其他功能
+        self.ready.emit(result)
+
+
 class Window(QMainWindow):
     PAGE_TITLES = (('我的车库', '已安装的游戏'), ('发现游戏', '可安装的游戏'),
                    ('账号', '登录态与账号快照'), ('网络', '代理与节点'))
@@ -575,6 +619,7 @@ class Window(QMainWindow):
         self.versions = {}          # product -> 后台核对出来的版本信息
         self.version_worker = None
         self.version_checked_at = 0.0
+        self.account_worker = None
         self.cover_worker = None
         self.store_proxy_url = None
         self.buttons = []          # 页面级按钮（账号/网络）
@@ -739,8 +784,10 @@ class Window(QMainWindow):
     def build_account_page(self):
         page = QWidget(); a = QVBoxLayout(page); a.setContentsMargins(28, 24, 28, 24); a.setSpacing(12)
         title = QLabel('账号管理'); title.setObjectName('section'); a.addWidget(title)
-        hint = QLabel('登录状态加密保存在本客户端的数据目录；切换前需要关闭游戏。')
+        hint = QLabel('登录状态加密保存在本客户端的数据目录。登录成功后会自动建档；想保留多份登录态就填编号与名称后点「保存当前账号」。')
         hint.setObjectName('muted'); hint.setWordWrap(True); a.addWidget(hint)
+        self.account_state = QLabel(''); self.account_state.setObjectName('muted')
+        self.account_state.setWordWrap(True); a.addWidget(self.account_state)
         self.accounts = QComboBox(); a.addWidget(self.accounts)
         form = QFormLayout(); form.setSpacing(10); self.number = QLineEdit(); self.name = QLineEdit()
         form.addRow('账号编号', self.number); form.addRow('显示名称', self.name); a.addLayout(form)
@@ -947,6 +994,12 @@ class Window(QMainWindow):
                 if account['key'] == value['active']:
                     self.accounts.setCurrentIndex(self.accounts.count()-1); active = account
             self.account_chip.setText(f"账号 {active['number']} · {active['name']}" if active else '未登录')
+            if active:
+                self.account_state.setText(f"当前登录：{active['name']}（{active['number']}）")
+            elif (data_dir() / 'session.dpapi').exists():
+                self.account_state.setText('检测到已有登录态但还没保存成账号，正在自动建档…')
+            else:
+                self.account_state.setText('当前未登录：请用「浏览器登录 / 续期」或「导入官方客户端登录态」')
             self.nodes.clear()
             store = NodeStore()
             enabled = 0
@@ -964,6 +1017,7 @@ class Window(QMainWindow):
         except Exception: pass
         self.kick_covers()
         self.kick_version_check()
+        self.kick_account_check()
         self.library_count.setText(f'{self.library_grid.count()} 款')
         self.update_hero()
 
@@ -1021,6 +1075,22 @@ class Window(QMainWindow):
         self.version_worker = VersionWorker(self.settings, targets)
         self.version_worker.verified.connect(self.version_arrived)
         self.version_worker.start()
+
+    def kick_account_check(self):
+        """登录过但一个账号都没存时，后台自动建一条，别让账号页空着。"""
+        if self.account_worker and self.account_worker.isRunning(): return
+        if not self.isVisible(): return
+        self.account_worker = AccountWorker(self.settings)
+        self.account_worker.ready.connect(self.account_ready)
+        self.account_worker.start()
+
+    def account_ready(self, payload):
+        profile = payload.get('profile') or {}
+        if not payload.get('registered'): return
+        self.report(f"已自动保存账号：{profile.get('name')}（{profile.get('number')}）")
+        if not self.number.text(): self.number.setText(str(profile.get('number') or ''))
+        if not self.name.text(): self.name.setText(str(profile.get('name') or ''))
+        self.refresh()
 
     def version_arrived(self, product, info):
         self.versions[product] = info
