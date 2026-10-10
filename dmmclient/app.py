@@ -701,17 +701,21 @@ class DetailPane(QScrollArea):
         while self.box.count():
             item = self.box.takeAt(0)
             widget = item.widget()
-            if widget is not None:
-                widget.setParent(None); widget.deleteLater()
+            if widget is not None: self._discard(widget)
             elif item.layout() is not None: self._drop_layout(item.layout())
+
+    @staticmethod
+    def _discard(widget):
+        """先 hide 再 setParent(None)：直接 setParent(None) 会把它变成独立顶层窗口，
+        于是屏幕上会闪出一堆小窗口再被 deleteLater 收走。"""
+        widget.hide(); widget.setParent(None); widget.deleteLater()
 
     @staticmethod
     def _drop_layout(layout):
         while layout.count():
             child = layout.takeAt(0)
             widget = child.widget()
-            if widget is not None:
-                widget.setParent(None); widget.deleteLater()
+            if widget is not None: DetailPane._discard(widget)
             elif child.layout() is not None: DetailPane._drop_layout(child.layout())
 
     def reveal(self, colors):
@@ -942,8 +946,8 @@ class Window(QMainWindow):
     def build_detail_view(self):
         page = QWidget(); row = QHBoxLayout(page)
         row.setContentsMargins(24, 20, 24, 20); row.setSpacing(18)
-        left = QWidget(); left.setObjectName('card'); left.setFixedWidth(286)
-        lbox = QVBoxLayout(left); lbox.setContentsMargins(14, 14, 14, 14); lbox.setSpacing(10)
+        left = QWidget(); lbox = QVBoxLayout(left)
+        lbox.setContentsMargins(0, 0, 0, 0); lbox.setSpacing(10)
         back = QPushButton('← 返回车库'); back.setObjectName('link')
         back.setCursor(Qt.PointingHandCursor); back.clicked.connect(self.close_detail)
         lbox.addWidget(back, 0, Qt.AlignLeft)
@@ -954,8 +958,13 @@ class Window(QMainWindow):
         self.game_list.currentItemChanged.connect(self.row_selected)
         enable_touch_scrolling(self.game_list)
         lbox.addWidget(self.game_list, 1)
-        row.addWidget(left)
-        self.detail = DetailPane(); row.addWidget(self.detail, 1)
+        left_panel = self.section('全部游戏', left); left_panel.setFixedWidth(300)
+        row.addWidget(left_panel)
+
+        self.detail = DetailPane()
+        right = QWidget(); rbox = QVBoxLayout(right)
+        rbox.setContentsMargins(0, 0, 0, 0); rbox.addWidget(self.detail, 1)
+        row.addWidget(self.section('游戏详情', right), 1)
         return page
 
     def build_store_page(self):
@@ -1358,8 +1367,8 @@ class Window(QMainWindow):
     # ---------- 游戏详情（主从布局） ----------
 
     def detail_products(self):
-        """左侧列表：已安装的游戏，外加正在看的那个（可能还没装）。"""
-        products = sorted({**official_records(), **records()})
+        """左侧列表：全部游戏 —— 已装、未装都在，可以随便切。"""
+        products = sorted(self.known_titles())
         current = getattr(self, 'detail_product', None)
         if current and current not in products: products.insert(0, current)
         return products

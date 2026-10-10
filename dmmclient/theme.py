@@ -116,15 +116,15 @@ def build_style(theme: str) -> str:
     QLabel#cardtitle {{ font-size:13.5px; font-weight:600; color:{p['text']}; }}
     QLabel#cardmeta {{ font-size:11.5px; color:{p['faint']}; }}
     QLabel#detailtitle {{ font-size:19px; font-weight:600; color:{p['text']}; }}
-    QLabel#cover {{ background:{p['surface3']}; border-radius:20px; color:{p['faint']};
+    QLabel#cover {{ background:{p['surface3']}; border-radius:24px; color:{p['faint']};
         font-size:12px; font-weight:600; }}
     QLabel#mark {{ background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4d7dff,stop:1 #7a5cff);
-        border-radius:10px; color:#ffffff; font-size:17px; font-weight:700; }}
-    QLabel#chip {{ background:{p['surface3']}; border-radius:14px; padding:9px 11px;
+        border-radius:14px; color:#ffffff; font-size:17px; font-weight:700; }}
+    QLabel#chip {{ background:{p['surface3']}; border-radius:18px; padding:9px 11px;
         font-size:12px; color:{p['dim']}; }}
     QLabel#heroTag {{ color:{p['ok']}; font-size:11px; font-weight:600; }}
     QLabel#heroTitle {{ font-size:22px; font-weight:600; color:{p['text']}; }}
-    QLabel#badge {{ border-radius:12px; padding:3px 9px; font-size:10.5px; font-weight:600;
+    QLabel#badge {{ border-radius:14px; padding:3px 9px; font-size:10.5px; font-weight:600;
         background:rgba(12,14,18,0.62); color:#ffffff; }}
     QLabel#badge[kind="ok"] {{ background:{p['ok']}; }}
     QLabel#badge[kind="up"] {{ background:{p['warn']}; }}
@@ -134,18 +134,18 @@ def build_style(theme: str) -> str:
     QWidget#sidebar {{ background:{p['surface']}; border-right:1px solid {p['border']}; }}
     QWidget#topbar {{ background:{p['bg']}; border-bottom:1px solid {p['border']}; }}
     QWidget#statusbar {{ background:{p['surface']}; border-top:1px solid {p['border']}; }}
-    QFrame#hero {{ background:{p['surface']}; border:1px solid {p['border']}; border-radius:24px; }}
+    QFrame#hero {{ background:{p['surface']}; border:1px solid {p['border']}; border-radius:28px; }}
     QWidget#chip {{ background:{p['surface3']}; border-radius:8px; }}
     QFrame#divider {{ border:none; background:{p['border']}; max-height:1px; }}
 
     /* 侧边栏导航 */
-    QPushButton#nav {{ background:transparent; border:none; border-radius:14px; padding:9px 12px;
+    QPushButton#nav {{ background:transparent; border:none; border-radius:18px; padding:9px 12px;
         text-align:left; font-size:13.5px; font-weight:400; color:{p['dim']}; }}
     QPushButton#nav:hover {{ background:{p['hover']}; color:{p['text']}; }}
     QPushButton#nav:checked {{ background:{p['accent_soft']}; color:{p['accent']}; font-weight:600; }}
 
     /* 卡片 */
-    QWidget#card {{ background:{p['surface']}; border:1px solid {p['border']}; border-radius:24px; }}
+    QWidget#card {{ background:{p['surface']}; border:1px solid {p['border']}; border-radius:28px; }}
     QWidget#card:hover {{ border-color:{p['border_strong']}; }}
 
     /* 按钮 */
@@ -178,7 +178,7 @@ def build_style(theme: str) -> str:
     QComboBox::drop-down {{ border:none; width:30px; }}
     QComboBox::down-arrow {{ {arrow_rule} }}
     QComboBox QAbstractItemView {{ background:{p['surface']}; border:1px solid {p['border_strong']};
-        border-radius:18px; padding:6px; outline:none;
+        border-radius:22px; padding:6px; outline:none;
         selection-background-color:{p['accent_soft']}; selection-color:{p['accent']}; }}
     QComboBox QAbstractItemView::item {{ padding:7px 10px; border-radius:8px; min-height:20px; }}
 
@@ -188,7 +188,7 @@ def build_style(theme: str) -> str:
     QProgressBar::chunk {{ border-radius:3px; background:{p['accent']}; }}
 
     /* 日志 */
-    QTextEdit {{ background:{p['surface']}; border:1px solid {p['border']}; border-radius:20px;
+    QTextEdit {{ background:{p['surface']}; border:1px solid {p['border']}; border-radius:24px;
         padding:8px; color:{p['dim']}; font-family:"Consolas","Microsoft YaHei UI",monospace; font-size:12px; }}
 
     /* 滚动条 */
@@ -198,8 +198,12 @@ def build_style(theme: str) -> str:
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background:transparent; }}
 
-    QWidget#detail {{ background:{p['surface']}; border:1px solid {p['border']}; border-radius:24px; }}
-    QWidget#listrow {{ background:transparent; border:1px solid transparent; border-radius:16px; }}
+    QWidget#detail {{ background:transparent; border:none; }}
+    QScrollArea#detailpane {{ background:transparent; border:none; }}
+    QListWidget#gamelist::item {{ background:transparent; border:none; }}
+    QListWidget#gamelist::item:selected {{ background:transparent; color:inherit; }}
+    QListWidget#gamelist::item:hover:!selected {{ background:transparent; }}
+    QWidget#listrow {{ background:transparent; border:1.5px solid transparent; border-radius:18px; }}
     QWidget#listrow:hover {{ background:{p['hover']}; }}
     QWidget#listrow[active="true"] {{ background:{p['accent_soft']}; border-color:{p['accent']}; }}
     QLabel#listtitle {{ font-size:12.5px; font-weight:600; color:{p['text']}; }}
