@@ -19,7 +19,7 @@ from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QMouseEvent, Q
     QPainterPath, QPixmap)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QProgressBar, QPushButton, QScroller, QScrollerProperties, QScrollArea, QTabWidget,
+    QProgressBar, QPushButton, QScroller, QScrollerProperties, QScrollArea, QStackedWidget,
     QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import restore_browser_proxy
@@ -33,6 +33,7 @@ from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCanc
 from .backend.settings import (load_settings, remember_install_base, game_install_base,
     game_install_root, install_bases)
 from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
+from .theme import build_style, palette, system_theme
 
 
 def divider():
@@ -145,7 +146,7 @@ def game_grid():
     grid = QListWidget()
     grid.setViewMode(QListWidget.IconMode); grid.setMovement(QListWidget.Static)
     grid.setResizeMode(QListWidget.Adjust); grid.setWrapping(True)
-    grid.setGridSize(QSize(258, 294)); grid.setSpacing(10)
+    grid.setGridSize(QSize(198, 358)); grid.setSpacing(0)
     grid.setVerticalScrollMode(QListWidget.ScrollPerPixel)
     grid.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     enable_touch_scrolling(grid)
@@ -385,7 +386,85 @@ class VersionWorker(QThread):
             pass
 
 
+def soft_backdrop(pixmap, width, height):
+    """把封面缩到极小再放大——廉价的高斯感模糊，用作「继续游戏」大图的背景。"""
+    if pixmap.isNull() or width <= 1 or height <= 1:
+        return QPixmap()
+    filled = pixmap.scaled(width, height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    tiny = filled.scaled(max(8, width // 26), max(8, height // 26),
+                         Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    return tiny.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+
+def square_cover(pixmap, size, radius=12):
+    """裁成正方形并切圆角：DMM 封面本身就是 1:1，这里只是兜底。"""
+    scaled = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    left = max(0, (scaled.width() - size) // 2)
+    top = max(0, (scaled.height() - size) // 2)
+    return rounded_pixmap(scaled.copy(left, top, size, size), radius)
+
+
+class HeroBanner(QFrame):
+    """车库页顶部的「继续游戏」大图：模糊封面当背景 + 清晰缩略图 + 主按钮。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('hero'); self.setFixedHeight(176)
+        self._cover = QPixmap(); self._backdrop = QPixmap()
+        self._veil = QColor('#0d0f13'); self._edge = QColor('#1f242d')
+        row = QHBoxLayout(self); row.setContentsMargins(26, 0, 26, 0); row.setSpacing(20)
+        self.thumb = QLabel(); self.thumb.setObjectName('cover'); self.thumb.setFixedSize(112, 112)
+        self.thumb.setAlignment(Qt.AlignCenter); self.thumb.setText('暂无封面')
+        row.addWidget(self.thumb, 0, Qt.AlignVCenter)
+        column = QVBoxLayout(); column.setSpacing(3)
+        self.tag = QLabel(''); self.tag.setObjectName('heroTag')
+        self.title = QLabel(''); self.title.setObjectName('heroTitle')
+        self.meta = QLabel(''); self.meta.setObjectName('muted')
+        self.acts = QHBoxLayout(); self.acts.setSpacing(9); self.acts.addStretch()
+        column.addWidget(self.tag); column.addWidget(self.title); column.addWidget(self.meta)
+        column.addSpacing(9); column.addLayout(self.acts); column.addStretch()
+        row.addLayout(column, 1)
+
+    def set_theme(self, colors):
+        self._veil = QColor(colors['surface']); self._edge = QColor(colors['border'])
+        self.update()
+
+    def set_game(self, tag, title, meta, pixmap=None):
+        self.tag.setText(tag); self.title.setText(title); self.meta.setText(meta)
+        self._cover = pixmap if pixmap is not None else QPixmap()
+        if self._cover.isNull():
+            self.thumb.setPixmap(QPixmap()); self.thumb.setText('暂无封面'); self._backdrop = QPixmap()
+        else:
+            self.thumb.setText(''); self.thumb.setPixmap(square_cover(self._cover, 112))
+        self._rebuild()
+
+    def _rebuild(self):
+        self._backdrop = soft_backdrop(self._cover, max(self.width(), 720), self.height())
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event); self._rebuild()
+
+    def paintEvent(self, event):
+        painter = QPainter(self); painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        path = QPainterPath(); path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
+        painter.setClipPath(path); painter.fillRect(self.rect(), self._veil)
+        if not self._backdrop.isNull():
+            painter.drawPixmap(0, 0, self._backdrop)
+        gradient = QLinearGradient(0, 0, self.width(), 0)
+        gradient.setColorAt(0.0, self._veil)
+        gradient.setColorAt(0.55, QColor(self._veil.red(), self._veil.green(), self._veil.blue(), 208))
+        gradient.setColorAt(1.0, QColor(self._veil.red(), self._veil.green(), self._veil.blue(), 96))
+        painter.fillRect(self.rect(), gradient)
+        painter.setPen(QColor(self._edge)); painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, 16, 16)
+        painter.end()
+
+
 class Window(QMainWindow):
+    PAGE_TITLES = (('我的车库', '已安装的游戏'), ('发现游戏', '可安装的游戏'),
+                   ('账号', '登录态与账号快照'), ('网络', '代理与节点'))
+
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
@@ -396,65 +475,140 @@ class Window(QMainWindow):
         self.version_checked_at = 0.0
         self.cover_worker = None
         self.store_proxy_url = None
-        self.buttons = []          # 页面级按钮（账号/网络/商店工具栏）
+        self.buttons = []          # 页面级按钮（账号/网络）
         self.library_buttons = []  # 车库卡片按钮（随网格重建）
         self.store_buttons = []    # 商店卡片按钮（随网格重建）
         self.library_covers = {}   # product -> [QLabel]，随网格重建
         self.store_covers = {}
         self.cover_tried = set()
-        self.setWindowTitle('DMM Light · 独立客户端预览版')
+        self.theme = system_theme()
+        self.setWindowTitle('DMM Light · 独立客户端')
         self.setWindowIcon(app_icon())
-        self.resize(1180, 820)
-        outer = QWidget(); self.setCentralWidget(outer)
-        layout = QVBoxLayout(outer); layout.setContentsMargins(24, 22, 24, 18); layout.setSpacing(12)
-        brand = QHBoxLayout()
-        column = QVBoxLayout(); column.setSpacing(2)
-        heading = QLabel('DMM Light'); heading.setObjectName('heading'); column.addWidget(heading)
-        tagline = QLabel('游戏管理中心 · 独立运行，不依赖官方 Player'); tagline.setObjectName('tagline'); column.addWidget(tagline)
-        brand.addLayout(column); brand.addStretch()
-        layout.addLayout(brand)
-        self.tabs = QTabWidget(); self.tabs.setTabPosition(QTabWidget.West); layout.addWidget(self.tabs, 1)
-        self.tabs.addTab(self.build_library_page(), '我的车库')
-        self.tabs.addTab(self.build_store_page(), '发现游戏')
-        self.tabs.addTab(self.build_account_page(), '账号')
-        self.tabs.addTab(self.build_network_page(), '网络')
+        self.resize(1240, 840)
 
-        self.status = QLabel('就绪'); self.status.setObjectName('status'); self.status.setWordWrap(True); layout.addWidget(self.status)
-        self.bar = QProgressBar(); self.bar.setValue(0); layout.addWidget(self.bar)
-        self.stats = QLabel(''); self.stats.setObjectName('muted'); layout.addWidget(self.stats)
-        self.pause = QPushButton('暂停当前操作'); self.pause.setObjectName('pause'); self.pause.setEnabled(False)
-        self.pause.clicked.connect(self.cancel); layout.addWidget(self.pause)
-        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(110); layout.addWidget(self.log)
-        enable_touch_scrolling(self.log)
+        root = QWidget(); self.setCentralWidget(root)
+        shell = QHBoxLayout(root); shell.setContentsMargins(0, 0, 0, 0); shell.setSpacing(0)
+        shell.addWidget(self.build_sidebar())
+
+        main = QWidget(); column = QVBoxLayout(main)
+        column.setContentsMargins(0, 0, 0, 0); column.setSpacing(0)
+        column.addWidget(self.build_topbar())
+        self.tabs = QStackedWidget()
+        self.tabs.addWidget(self.build_library_page())
+        self.tabs.addWidget(self.build_store_page())
+        self.tabs.addWidget(self.build_account_page())
+        self.tabs.addWidget(self.build_network_page())
+        column.addWidget(self.tabs, 1)
+        column.addWidget(self.build_statusbar())
+        shell.addWidget(main, 1)
+
+        self.apply_theme(self.theme)
+        self.show_page(0)
         self.refresh()
+
+    # ---------- 主题 ----------
+
+    def apply_theme(self, theme):
+        """跟随系统切换明暗；界面用的是全局样式表，改一次就够。"""
+        self.theme = theme
+        application = QApplication.instance()
+        if application is not None: application.setStyleSheet(build_style(theme))
+        self.hero.set_theme(palette(theme))
+
+    # ---------- 骨架 ----------
+
+    def build_sidebar(self):
+        side = QWidget(); side.setObjectName('sidebar'); side.setFixedWidth(236)
+        box = QVBoxLayout(side); box.setContentsMargins(14, 18, 14, 16); box.setSpacing(3)
+        brand = QHBoxLayout(); brand.setSpacing(10); brand.setContentsMargins(6, 0, 0, 16)
+        mark = QLabel('D'); mark.setObjectName('mark'); mark.setFixedSize(34, 34); mark.setAlignment(Qt.AlignCenter)
+        column = QVBoxLayout(); column.setSpacing(0)
+        heading = QLabel('DMM Light'); heading.setObjectName('heading'); column.addWidget(heading)
+        tagline = QLabel('独立客户端'); tagline.setObjectName('tagline'); column.addWidget(tagline)
+        brand.addWidget(mark); brand.addLayout(column); brand.addStretch()
+        box.addLayout(brand)
+        self.nav_buttons = []
+        for index, (title, _) in enumerate(self.PAGE_TITLES):
+            button = QPushButton(title); button.setObjectName('nav'); button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _, i=index: self.show_page(i))
+            box.addWidget(button); self.nav_buttons.append(button)
+        box.addStretch()
+        self.account_chip = QLabel('未登录'); self.account_chip.setObjectName('chip')
+        self.node_chip = QLabel('节点未就绪'); self.node_chip.setObjectName('chip')
+        box.addWidget(self.account_chip); box.addWidget(self.node_chip)
+        return side
+
+    def build_topbar(self):
+        bar = QWidget(); bar.setObjectName('topbar'); bar.setFixedHeight(64)
+        row = QHBoxLayout(bar); row.setContentsMargins(24, 0, 24, 0); row.setSpacing(12)
+        self.page_title = QLabel('我的车库'); self.page_title.setObjectName('pagetitle')
+        self.page_sub = QLabel(''); self.page_sub.setObjectName('muted')
+        row.addWidget(self.page_title); row.addWidget(self.page_sub); row.addStretch()
+        self.search = QLineEdit(); self.search.setPlaceholderText('搜索游戏名…')
+        self.search.setFixedWidth(240)
+        self.search.textChanged.connect(lambda _: self.repopulate_store())
+        row.addWidget(self.search)
+        self.top_button = QPushButton('刷新'); self.top_button.setCursor(Qt.PointingHandCursor)
+        self.top_button.clicked.connect(self.top_action); row.addWidget(self.top_button)
+        return bar
+
+    def build_statusbar(self):
+        wrap = QWidget(); wrap.setObjectName('statusbar')
+        column = QVBoxLayout(wrap); column.setContentsMargins(24, 10, 24, 12); column.setSpacing(8)
+        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(120)
+        self.log.hide(); enable_touch_scrolling(self.log); column.addWidget(self.log)
+        row = QHBoxLayout(); row.setSpacing(14)
+        self.bar = QProgressBar(); self.bar.setValue(0); self.bar.setTextVisible(False); self.bar.setFixedWidth(300)
+        self.bar.hide()   # 空闲时不显示进度条
+        self.status = QLabel('就绪'); self.status.setObjectName('status')
+        self.stats = QLabel(''); self.stats.setObjectName('muted')
+        self.pause = QPushButton('暂停'); self.pause.setObjectName('pause'); self.pause.setEnabled(False)
+        self.pause.clicked.connect(self.cancel)
+        self.log_button = QPushButton('日志'); self.log_button.setObjectName('pause'); self.log_button.setCheckable(True)
+        self.log_button.toggled.connect(lambda on: self.log.setVisible(on))
+        row.addWidget(self.bar); row.addWidget(self.status, 1); row.addWidget(self.stats)
+        row.addWidget(self.pause); row.addWidget(self.log_button)
+        column.addLayout(row)
+        return wrap
+
+    def show_page(self, index):
+        self.tabs.setCurrentIndex(index)
+        for position, button in enumerate(self.nav_buttons):
+            button.setChecked(position == index)
+        title, subtitle = self.PAGE_TITLES[index]
+        self.page_title.setText(title); self.page_sub.setText(subtitle)
+        self.search.setVisible(index == 1)
+        self.top_button.setText('刷新游戏列表' if index == 1 else '刷新')
+
+    def top_action(self):
+        if self.tabs.currentIndex() == 1:
+            self.run_action('refresh-catalog'); return
+        self.version_checked_at = 0.0; self.kick_version_check(); self.refresh()
+        self.report('已刷新')
 
     # ---------- 页面构建 ----------
 
     def build_library_page(self):
-        page = QWidget(); box = QVBoxLayout(page); box.setContentsMargins(24, 20, 24, 20); box.setSpacing(10)
-        head = QHBoxLayout()
-        title = QLabel('我的车库'); title.setObjectName('section'); head.addWidget(title); head.addStretch()
-        hint = QLabel('卡片上直接启动或更新；启动前自动检查、下载并校验更新。')
-        hint.setObjectName('muted'); head.addWidget(hint)
-        box.addLayout(head)
+        page = QWidget(); box = QVBoxLayout(page); box.setContentsMargins(24, 20, 24, 20); box.setSpacing(16)
+        self.hero = HeroBanner(); box.addWidget(self.hero)
+        head = QHBoxLayout(); head.setSpacing(10)
+        title = QLabel('全部游戏'); title.setObjectName('section'); head.addWidget(title)
+        self.library_count = QLabel(''); self.library_count.setObjectName('muted'); head.addWidget(self.library_count)
+        head.addStretch(); box.addLayout(head)
         self.library_grid = game_grid(); box.addWidget(self.library_grid, 1)
         return page
 
     def build_store_page(self):
-        page = QWidget(); box = QVBoxLayout(page); box.setContentsMargins(24, 20, 24, 20); box.setSpacing(10)
-        head = QHBoxLayout(); head.setSpacing(10)
-        title = QLabel('发现游戏'); title.setObjectName('section'); head.addWidget(title)
-        self.search = QLineEdit(); self.search.setPlaceholderText('搜索游戏名…'); self.search.setObjectName('search')
-        head.addWidget(self.search, 1)
+        page = QWidget(); box = QVBoxLayout(page); box.setContentsMargins(24, 20, 24, 20); box.setSpacing(12)
+        row = QHBoxLayout(); row.setSpacing(10)
         self.filter_box = QComboBox()
         self.filter_box.addItems(['全部游戏', '一般游戏', 'Fanza R18', '已安装'])
-        head.addWidget(self.filter_box)
-        self.button(head, '刷新游戏列表', 'refresh-catalog')
-        box.addLayout(head)
+        self.filter_box.setFixedWidth(150); row.addWidget(self.filter_box); row.addStretch()
+        box.addLayout(row)
         hint = QLabel('免官方 Player 全新安装；仅支持标准下载型游戏，需要专用安装程序或 DRM 的会明确拒绝。个别游戏要先装 VC++ / DirectX 运行库，客户端会自动下载并运行（可能弹 UAC）。Fanza 游戏需年龄认证账号，与一般版版本各自独立。')
         hint.setObjectName('muted'); hint.setWordWrap(True); box.addWidget(hint)
         self.store_grid = game_grid(); box.addWidget(self.store_grid, 1)
-        self.search.textChanged.connect(lambda _: self.repopulate_store())
         self.filter_box.currentIndexChanged.connect(lambda _: self.repopulate_store())
         return page
 
@@ -468,10 +622,11 @@ class Window(QMainWindow):
         form.addRow('账号编号', self.number); form.addRow('显示名称', self.name); a.addLayout(form)
         row = QHBoxLayout(); row.setSpacing(10); a.addLayout(row)
         self.button(row, '登录新账号', 'new-account'); self.button(row, '保存当前账号', 'save-account')
-        self.button(row, '切换所选账号', 'switch-account')
+        self.button(row, '切换所选账号', 'switch-account'); row.addStretch()
         a.addWidget(divider())
         row = QHBoxLayout(); row.setSpacing(10); a.addLayout(row)
         self.button(row, '浏览器登录 / 续期', 'login'); self.button(row, '导入官方客户端登录态', 'import-login')
+        row.addStretch()
         hint = QLabel('密码与验证码只在 DMM 官方网页输入。登录成功后复制成功页地址即可返回客户端。')
         hint.setObjectName('muted'); hint.setWordWrap(True); a.addWidget(hint)
         a.addStretch(); return scrollable_page(page)
@@ -485,7 +640,7 @@ class Window(QMainWindow):
         hint = QLabel('外部代理也用于首次下载 Xray 内核；已有内核时，内置模式不依赖 v2rayN。')
         hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
         row = QHBoxLayout(); row.setSpacing(10); n.addLayout(row)
-        self.button(row, '保存代理设置', 'settings'); self.button(row, '测试 DMM 连接', 'test')
+        self.button(row, '保存代理设置', 'settings'); self.button(row, '测试 DMM 连接', 'test'); row.addStretch()
         self.sysproxy = QPushButton('开启系统代理（给本机浏览器临时用）'); self.sysproxy.setCheckable(True)
         self.sysproxy.toggled.connect(self.toggle_system_proxy); n.addWidget(self.sysproxy)
         hint = QLabel('开启后本机浏览器经本客户端节点访问 DMM（用于商店加库）；关闭软件或再点一次即还原。')
@@ -494,36 +649,71 @@ class Window(QMainWindow):
         self.node_text = QLineEdit(); self.node_text.setEchoMode(QLineEdit.EchoMode.Password)
         self.node_text.setPlaceholderText('粘贴节点分享链接或单节点 Xray JSON，内容隐藏'); n.addWidget(self.node_text)
         row = QHBoxLayout(); row.setSpacing(10); n.addLayout(row)
-        self.button(row, '添加节点', 'import-node'); self.button(row, '导入 JSON 文件', 'node-file')
+        self.button(row, '添加节点', 'import-node'); self.button(row, '导入 JSON 文件', 'node-file'); row.addStretch()
         hint = QLabel('最多 32 个节点，轮换使用，连接失败自动尝试下一节点。\n浏览器登录使用 HTTP 代理或内置节点池；SOCKS5 支持 API、更新和下载。')
         hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
         n.addStretch(); return scrollable_page(page)
 
     # ---------- 卡片 ----------
 
+    CARD_WIDTH = 178
+    CARD_HEIGHT = 338
+    COVER_SIZE = 158
+
     def make_card(self, grid, buttons, covers, product, title, state, card_buttons, extra=()):
-        card = QWidget(); card.setObjectName('card'); card.setFixedSize(226, 280)
-        box = QVBoxLayout(card); box.setContentsMargins(10, 10, 10, 12); box.setSpacing(7)
+        card = QWidget(); card.setObjectName('card')
+        card.setFixedSize(self.CARD_WIDTH, self.CARD_HEIGHT)
+        box = QVBoxLayout(card); box.setContentsMargins(10, 10, 10, 11); box.setSpacing(8)
         cover = QLabel('暂无封面'); cover.setObjectName('cover'); cover.setAlignment(Qt.AlignCenter)
-        cover.setFixedSize(204, 96)
+        cover.setFixedSize(self.COVER_SIZE, self.COVER_SIZE)
+        for text, kind, right in self.card_badges(state):
+            tag = QLabel(text, cover); tag.setObjectName('badge'); tag.setProperty('kind', kind)
+            tag.adjustSize()
+            tag.move(cover.width() - tag.width() - 8 if right else 8, 8)
         box.addWidget(cover, 0, Qt.AlignHCenter)
         name = QLabel(title); name.setObjectName('cardtitle'); name.setWordWrap(True)
-        name.setMaximumHeight(42); box.addWidget(name)
-        info = QLabel(state); info.setObjectName('muted'); info.setWordWrap(True); box.addWidget(info)
+        name.setFixedHeight(38); box.addWidget(name)
+        info = QLabel(state); info.setObjectName('cardmeta'); info.setWordWrap(True)
+        info.setFixedHeight(32); box.addWidget(info)
         box.addStretch()
-        row = QHBoxLayout(); row.setSpacing(6); box.addLayout(row)
-        for text, action, accent in list(card_buttons) + list(extra):
-            button = QPushButton(text); button.setObjectName('mini')
-            if accent: button.setProperty('accent', True)
+        spec = list(card_buttons) + list(extra)
+        primary = next((item for item in spec if item[2]), None)
+        if primary is not None:
+            text, action, _ = primary
+            button = QPushButton(text); button.setProperty('accent', True)
+            button.setCursor(Qt.PointingHandCursor)
             button.clicked.connect(lambda _, a=action, p=product: self.run_action(a, p))
-            row.addWidget(button); buttons.append(button)
+            box.addWidget(button); buttons.append(button)
+        secondary = [item for item in spec if item is not primary]
+        if secondary:
+            row = QHBoxLayout(); row.setSpacing(2)
+            for text, action, _ in secondary:
+                button = QPushButton(text); button.setObjectName('link')
+                button.setCursor(Qt.PointingHandCursor)
+                button.clicked.connect(lambda _, a=action, p=product: self.run_action(a, p))
+                row.addWidget(button); buttons.append(button)
+            box.addLayout(row)
         covers.setdefault(product, []).append(cover)
         if cover_path(data_dir(), product).is_file(): self.paint_cover(cover, product)
         return card
 
     def add_card(self, grid, card):
-        item = QListWidgetItem(); item.setSizeHint(QSize(234, 288))
+        item = QListWidgetItem()
+        item.setSizeHint(QSize(self.CARD_WIDTH + 10, self.CARD_HEIGHT + 10))
         grid.addItem(item); grid.setItemWidget(item, card)
+
+    @staticmethod
+    def card_badges(state):
+        """卡片状态角标：左上角状态，右上角 R18。"""
+        if '未安装' in state: badges = [('未安装', 'new', False)]
+        elif '可更新' in state: badges = [('可更新', 'up', False)]
+        else: badges = [('已安装', 'ok', False)]
+        if 'R18' in state: badges.append(('R18', 'r18', True))
+        return badges
+
+    def cover_pixmap(self, product):
+        path = cover_path(data_dir(), product) if product else None
+        return QPixmap(str(path)) if path and path.is_file() else QPixmap()
 
     def all_covers(self):
         merged = {}
@@ -538,7 +728,16 @@ class Window(QMainWindow):
         titles.update({item['product']: item['title'] for item in catalog()})
         titles.update({product: value.get('title', product) for product, value in official_records().items()})
         titles.update({product: value.get('title', product) for product, value in records().items()})
+        titles['gakumas'] = '学园偶像大师'   # 官方记录里的标题就是 product id，别把中文名覆盖掉
         return titles
+
+    @staticmethod
+    def installed_version(product, fallback):
+        """学园偶像大师的版本以本客户端的 installation.json 为准（官方 dmmgame.cnf 会过期）。"""
+        if product == 'gakumas':
+            try: return DmmHelper.installed_game()[1]
+            except DmmError: pass
+        return fallback
 
     @staticmethod
     def _restore_scroll(grid, offset):
@@ -613,14 +812,20 @@ class Window(QMainWindow):
             self.repopulate_library(True); self.repopulate_store(True)
             value = AccountStore(data_dir()).read()
             self.accounts.clear()
+            active = None
             for account in value['accounts']:
                 self.accounts.addItem(f"{account['number']} · {account['name']}", account['number'])
-                if account['key'] == value['active']: self.accounts.setCurrentIndex(self.accounts.count()-1)
+                if account['key'] == value['active']:
+                    self.accounts.setCurrentIndex(self.accounts.count()-1); active = account
+            self.account_chip.setText(f"账号 {active['number']} · {active['name']}" if active else '未登录')
             self.nodes.clear()
             store = NodeStore()
+            enabled = 0
             if store.path.exists():
                 for node in store.read()['nodes']:
+                    if node['enabled']: enabled += 1
                     self.nodes.addItem(node['name'] + (' · 已启用' if node['enabled'] else ' · 已停用'), node['id'])
+            self.node_chip.setText(f'{enabled} 个节点可用' if enabled else '没有可用节点')
         except DmmError as error:
             self.status.setText(str(error))
         except Exception:
@@ -630,6 +835,42 @@ class Window(QMainWindow):
         except Exception: pass
         self.kick_covers()
         self.kick_version_check()
+        self.library_count.setText(f'{self.library_grid.count()} 款')
+        self.update_hero()
+
+    def update_hero(self):
+        """车库页顶部的「继续游戏」：优先上次启动的，否则第一款已安装游戏。"""
+        installed = {**official_records(), **records()}
+        product = self.settings.get('last_launched')
+        if product not in installed:
+            product = 'gakumas' if 'gakumas' in installed else (sorted(installed)[0] if installed else None)
+        while self.hero.acts.count():
+            widget = self.hero.acts.takeAt(0).widget()
+            if widget is not None: widget.deleteLater()
+        if product is None:
+            self.hero.set_game('还没有游戏', '去「发现游戏」里挑一款装上吧', '装好后这里会显示最近启动的游戏')
+            self.hero.acts.addStretch(); return
+        value = installed[product]
+        version = self.installed_version(product, value.get('version', '未知'))
+        self.hero.set_game('继续游戏', self.known_titles().get(product, product),
+                           f"已安装 · 版本 {version}{self.version_note(product)}",
+                           self.cover_pixmap(product))
+        spec = ([('启动游戏', 'launch', True), ('检查更新', 'check', False), ('选择目录', 'game-folder', False)]
+                if product == 'gakumas' else
+                [('启动游戏', 'game-launch', True), ('检查更新', 'game-check', False), ('打开目录', 'game-dir', False)])
+        for text, action, accent in spec:
+            button = QPushButton(text); button.setCursor(Qt.PointingHandCursor)
+            if accent: button.setProperty('accent', True)
+            button.clicked.connect(lambda _, a=action, p=product: self.run_action(a, p))
+            self.hero.acts.addWidget(button)
+        self.hero.acts.addStretch()
+
+    def remember_launch(self, product):
+        """记下最近启动的游戏，车库页大图用它。"""
+        if not product or self.settings.get('last_launched') == product: return
+        self.settings['last_launched'] = product
+        try: atomic_write(data_dir() / 'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
+        except OSError: pass
 
     def version_note(self, product):
         """版本提示：后台核对出有待更新文件时，说明能更新到哪个版本。"""
@@ -654,17 +895,13 @@ class Window(QMainWindow):
 
     def version_arrived(self, product, info):
         self.versions[product] = info
-        self.repopulate_library(True); self.repopulate_store(True)
+        self.repopulate_library(True); self.repopulate_store(True); self.update_hero()
 
     def paint_cover(self, label, product):
-        path = cover_path(data_dir(), product) if product else None
-        pixmap = QPixmap(str(path)) if path and path.is_file() else QPixmap()
-        if not pixmap.isNull():
-            scaled = pixmap.scaled(label.width() - 4, label.height() - 4,
-                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            label.setText(''); label.setPixmap(rounded_pixmap(scaled))
-        else:
-            label.setPixmap(QPixmap()); label.setText('暂无封面\n后台自动下载')
+        pixmap = self.cover_pixmap(product)
+        if pixmap.isNull():
+            label.setPixmap(QPixmap()); label.setText('暂无封面'); return
+        label.setText(''); label.setPixmap(square_cover(pixmap, label.width()))
 
     def kick_covers(self):
         if not self.isVisible() or (self.cover_worker and self.cover_worker.isRunning()): return
@@ -851,6 +1088,7 @@ class Window(QMainWindow):
                 self.refresh(); self.report('游戏目录已保存'); return
             if action == 'game-dir':
                 self.choose_game_directory(product); return
+            if action in {'launch', 'game-launch'}: self.remember_launch(product)
             self.settings = {'proxy': valid_proxy(self.proxy.text().strip()), NODE_ENABLED_KEY: self.mode.currentIndex()==0}
             atomic_write(data_dir()/'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
             if action == 'settings': self.status.setText('代理设置已保存'); return
@@ -931,7 +1169,7 @@ class Window(QMainWindow):
         self.worker.download.connect(lambda percent, text: (self.bar.setRange(0,100), self.bar.setValue(percent), self.stats.setText(text)))
         self.worker.finished_ok.connect(self.report); self.worker.failed.connect(self.report)
         self.worker.finished.connect(self.operation_finished)
-        self.pause.setEnabled(True); self.bar.setRange(0,0)
+        self.pause.setEnabled(True); self.bar.setRange(0,0); self.bar.show()
         self.status.setText('正在处理…'); self.worker.start()
 
     def report(self, message):
@@ -947,7 +1185,8 @@ class Window(QMainWindow):
         if self.pending_actions:
             self.start_operation(self.pending_actions.popleft())
             return
-        self.pause.setEnabled(False); self.bar.setRange(0,100); self.node_text.clear(); self.refresh()
+        self.pause.setEnabled(False); self.bar.setRange(0,100); self.bar.hide()
+        self.node_text.clear(); self.refresh()
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
@@ -957,58 +1196,6 @@ class Window(QMainWindow):
             restore_system_proxy()
             HUB.shutdown()
             event.accept()
-
-
-STYLE = '''QWidget { background:#0b101b; color:#dfe7f3; font-family:"Microsoft YaHei UI"; font-size:14px; }
-    QLabel { background:transparent; }
-    QLabel#heading { font-size:30px; font-weight:800; color:#ffffff; letter-spacing:1px; }
-    QLabel#tagline { font-size:13px; color:#8fa1bd; }
-    QLabel#section { font-size:17px; font-weight:700; color:#9db8ff; }
-    QLabel#muted { color:#8fa1bd; }
-    QLabel#status { font-size:15px; font-weight:700; color:#eaf1fb; }
-    QLabel#cardtitle { font-size:13px; font-weight:700; color:#eaf1fb; }
-    QLabel#detailtitle { font-size:19px; font-weight:800; color:#ffffff; }
-    QLabel#cover { background:#0e1420; border:1px solid #24304a; border-radius:10px; color:#5a6780; font-size:12px; font-weight:600; }
-    QTabWidget::pane { border:1px solid #1c2740; border-radius:14px; background:#111827; left:-1px; }
-    QTabBar { background:transparent; }
-    QTabBar::tab { background:transparent; color:#8fa1bd; font-weight:600; padding:16px 14px;
-        min-width:78px; border:1px solid transparent; border-radius:10px; margin-bottom:6px; }
-    QTabBar::tab:selected { background:#1c2841; color:#ffffff; border-color:#27375a; }
-    QTabBar::tab:hover:!selected { color:#c4d2ea; }
-    QListWidget { background:transparent; border:none; }
-    QListWidget::item { border:none; background:transparent; }
-    QWidget#card { background:#0e1420; border:1px solid #1c2740; border-radius:12px; }
-    QPushButton { background:#1a2334; border:1px solid #26334c; border-radius:10px; padding:10px 18px; color:#dfe7f3; font-weight:600; }
-    QPushButton:hover { background:#22304a; border-color:#33456a; }
-    QPushButton:pressed { background:#182135; }
-    QPushButton:disabled { background:#141c2b; border-color:#1f2a40; color:#5a6780; }
-    QPushButton#mini { padding:7px 6px; border-radius:8px; font-size:12px; }
-    QPushButton[accent="true"] { border:none; color:#ffffff;
-        background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4d7dff, stop:1 #7a5cff); }
-    QPushButton[accent="true"]:hover { background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #6290ff, stop:1 #8f74ff); }
-    QPushButton[accent="true"]:pressed { background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #3f6ae6, stop:1 #6a4de0); }
-    QPushButton[accent="true"]:disabled { background:#2a3550; color:#7286a8; }
-    QLineEdit, QComboBox { background:#0e1420; border:1px solid #24304a; border-radius:9px; padding:9px 12px;
-        color:#e7eef9; selection-background-color:#4d7dff; selection-color:#ffffff; }
-    QLineEdit:focus, QComboBox:focus { border:1px solid #5b8cff; background:#101827; }
-    QLineEdit:disabled, QComboBox:disabled { color:#5a6780; background:#10151f; border-color:#1c2740; }
-    QComboBox::drop-down { border:none; width:28px; }
-    QComboBox::down-arrow { image:none; border-left:5px solid transparent; border-right:5px solid transparent;
-        border-top:6px solid #8fa1bd; margin-right:12px; }
-    QComboBox QAbstractItemView { background:#131b2b; border:1px solid #26334c; border-radius:8px;
-        selection-background-color:#233355; selection-color:#ffffff; outline:none; }
-    QProgressBar { background:#0e1420; border:1px solid #24304a; border-radius:8px; text-align:center;
-        color:#dfe7f3; font-weight:600; min-height:16px; }
-    QProgressBar::chunk { border-radius:7px;
-        background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #4d7dff, stop:1 #7a5cff); }
-    QTextEdit { background:#0d1220; border:1px solid #1f2a40; border-radius:10px; padding:6px;
-        color:#a8b8d4; font-family:"Consolas","Microsoft YaHei UI"; font-size:12px; }
-    QFrame#divider { border:none; background:#1c2740; max-height:1px; }
-    QScrollBar:vertical { background:transparent; width:10px; margin:2px; }
-    QScrollBar::handle:vertical { background:#24304a; border-radius:5px; min-height:30px; }
-    QScrollBar::handle:vertical:hover { background:#33456a; }
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
-    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }'''
 
 
 def setup_logging():
@@ -1030,8 +1217,12 @@ def main():
     log = setup_logging()
     try:
         app = QApplication(sys.argv)
-        app.setStyleSheet(STYLE)
         window = Window(); window.show()
+        try:
+            # 跟随系统明暗：系统切换时立刻换肤，不用重启
+            app.styleHints().colorSchemeChanged.connect(lambda _: window.apply_theme(system_theme()))
+        except AttributeError:
+            pass
         return app.exec()
     except BaseException:
         log.write(traceback.format_exc())
