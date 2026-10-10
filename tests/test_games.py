@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from dmmclient.backend.games import GameService
-from dmmclient.backend.session import DmmError
+from dmmclient.backend.session import DmmError, data_dir
 
 
 class GameTests(unittest.TestCase):
@@ -263,6 +263,48 @@ class UninstallTests(unittest.TestCase):
                  patch('dmmclient.backend.games.game_running', return_value=False):
                 with self.assertRaises(DmmError): uninstall_game('game1')
             self.assertTrue(root.exists(), '不安全的目标必须原样保留')
+
+
+class DetailTests(unittest.TestCase):
+    """商店详情来自官方 /v5/detail/product，不抓网页。"""
+
+    def test_normalize_shapes_the_api_payload(self):
+        from dmmclient.backend.games import _normalize_detail
+        value = _normalize_detail({
+            'title': '游戏', 'content_text': '第一行<br>第二行<br/>第三行',
+            'captions': ['需要 10GB'],
+            'gallery_images': [{'thumbnail_url': 't', 'image_url': 'f'}, {'thumbnail_url': 'x'}],
+            'gallery_movies': [{'thumbnail': 'mt', 'mp4_url': 'm'}],
+            'link_tables': [{'disp_key': '提供元', 'disp_items': [{'disp_value': 'A'}, {'disp_value': 'B'}]},
+                            {'disp_key': '空的', 'disp_items': []}],
+            'specs': [{'target_os': 'Windows', 'spec_html': 'OS:Win11<br>内存:16GB'}],
+        })
+        self.assertEqual(value['title'], '游戏')
+        self.assertEqual(value['description'], '第一行\n第二行\n第三行')
+        self.assertEqual(value['captions'], ['需要 10GB'])
+        self.assertEqual(value['images'], [{'thumb': 't', 'full': 'f'}])   # 缺 image_url 的丢掉
+        self.assertEqual(value['movies'][0]['mp4'], 'm')
+        self.assertEqual(value['info'], [{'key': '提供元', 'value': 'A / B'}])   # 空表丢掉
+        self.assertEqual(value['specs'][0]['html'], 'OS:Win11\n内存:16GB')
+
+    def test_store_detail_prefers_the_local_cache(self):
+        from dmmclient.backend.games import store_detail
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}):
+            cache = data_dir() / 'details'; cache.mkdir(parents=True)
+            (cache / 'game1.json').write_text(json.dumps({'title': '缓存标题'}), encoding='utf-8')
+            session = Mock()
+            self.assertEqual(store_detail(session, 'game1')['title'], '缓存标题')
+            session.request.assert_not_called()
+
+    def test_store_detail_tries_the_other_game_type(self):
+        from dmmclient.backend.games import store_detail
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'LOCALAPPDATA': folder}):
+            session = Mock(); session.device = {}
+            session.request.side_effect = [DmmError('拒绝'), {'title': '第二次成功'}, {'link_list': []}]
+            with patch('dmmclient.backend.games.set_age_cookie'):
+                self.assertEqual(store_detail(session, 'game1')['title'], '第二次成功')
+            paths = [call.args[0] for call in session.request.call_args_list]
+            self.assertEqual(paths[:2], ['/v5/detail/product'] * 2)   # 换类型重试了一次
 
 
 if __name__=='__main__': unittest.main()

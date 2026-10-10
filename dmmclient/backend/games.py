@@ -254,6 +254,87 @@ def _safe_to_remove(root):
     return True
 
 
+def _plain(value):
+    return re.sub(r'<br\s*/?>', '\n', str(value or '')).strip()
+
+
+def _normalize_detail(data):
+    """把 /v5/detail/product 的响应整理成详情页好用的形状。"""
+    info = []
+    for table in data.get('link_tables') or []:
+        if not isinstance(table, dict): continue
+        key = str(table.get('disp_key') or '').strip()
+        values = [str(item.get('disp_value') or '').strip()
+                  for item in (table.get('disp_items') or []) if isinstance(item, dict)]
+        values = [value for value in values if value]
+        if key and values: info.append({'key': key, 'value': ' / '.join(values)})
+    return {
+        'title': str(data.get('title') or '').strip(),
+        'description': _plain(data.get('content_text')),
+        'captions': [str(item) for item in (data.get('captions') or []) if item],
+        'images': [{'thumb': item.get('thumbnail_url'), 'full': item.get('image_url')}
+                   for item in (data.get('gallery_images') or [])
+                   if isinstance(item, dict) and item.get('image_url')],
+        'movies': [{'thumb': item.get('thumbnail'), 'mp4': item.get('mp4_url')}
+                   for item in (data.get('gallery_movies') or []) if isinstance(item, dict)],
+        'info': info,
+        'specs': [{'os': item.get('target_os'), 'html': _plain(item.get('spec_html'))}
+                  for item in (data.get('specs') or []) if isinstance(item, dict)],
+        'price': data.get('price'), 'new': bool(data.get('is_new')),
+        'premium': bool(data.get('is_premium')),
+    }
+
+
+def store_detail(session, product, adult=False):
+    """商店商品详情：官方 /v5/detail/product 直接给简介、截图、宣传片、提供元、运行环境。
+
+    不用抓网页。结果按商品缓存在 details/ 下；R18 要带年龄认证 cookie。
+    """
+    cache = data_dir() / 'details' / f'{product}.json'
+    if cache.is_file():
+        try:
+            value = json.loads(cache.read_text(encoding='utf-8'))
+            if isinstance(value, dict) and value.get('title'): return value
+        except Exception:
+            pass
+    payload = {'product_id': product, 'game_os': 'win', **session.device}
+    for game_type, verified in ((('ACL' if adult else 'GCL'), adult),
+                                (('GCL' if adult else 'ACL'), not adult)):
+        try:
+            set_age_cookie(session, verified)
+            data = session.request('/v5/detail/product', {**payload, 'game_type': game_type})
+        except DmmError:
+            continue
+        if isinstance(data, dict) and data.get('title'):
+            value = _normalize_detail(data); value['game_type'] = game_type
+            try:
+                links = session.request('/v5/detail/links', {**payload, 'game_type': game_type})
+                if isinstance(links, dict):
+                    value['links'] = [{'url': item.get('url'), 'text': item.get('text')}
+                                      for item in (links.get('link_list') or [])
+                                      if isinstance(item, dict) and item.get('url')]
+            except DmmError:
+                pass
+            atomic_write(cache, json.dumps(value, ensure_ascii=False).encode())
+            return value
+    return None
+
+
+def fetch_shot(http, url, target):
+    """下载详情页的截图/宣传图到本地缓存（图片走 https，宣传片是 http 就不下）。"""
+    if target.is_file(): return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with http.get(dmm_url(url), stream=True, timeout=(10, 60)) as response:
+        if response.status_code != 200:
+            raise DmmError(f'图片下载失败：HTTP {response.status_code}')
+        temporary = target.with_name(target.name + '.part')
+        with temporary.open('wb') as output:
+            for block in response.iter_content(128 * 1024):
+                if block: output.write(block)
+        os.replace(temporary, target)
+    return target
+
+
 def uninstall_game(product, keep_files=False, progress=lambda done, total: None,
                    cancel_check=lambda: None, message=lambda text: None):
     """卸载本客户端安装的游戏；keep_files=True 时只移除安装记录，文件留着。
