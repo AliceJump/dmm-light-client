@@ -19,6 +19,10 @@ from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir, dmm
 from .settings import game_install_root, remember_install_base
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
 
+# JSON 文件缓存：key -> (mtime_ns, 解析结果)。mtime 没变就直接复用，
+# 避免 GUI 线程每次快照都重复读盘解析（catalog/games.json/dmmgame.cnf）。
+_json_cache = {}
+
 SUPPORTED = {'priconner': '公主连结 Re:Dive（日服）'}
 
 
@@ -39,7 +43,15 @@ def checked_product(value):
 
 def catalog():
     path=data_dir()/'catalog.json'
-    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
+    if not path.exists(): return []
+    try: mtime=path.stat().st_mtime_ns
+    except OSError: return []
+    key='catalog:'+str(path)
+    hit=_json_cache.get(key)
+    if hit and hit[0]==mtime: return list(hit[1])
+    value=json.loads(path.read_text(encoding='utf-8'))
+    _json_cache[key]=(mtime,value)
+    return list(value)
 
 
 def set_age_cookie(session, verified):
@@ -120,10 +132,16 @@ def installed_record(product):
 
 
 def official_records():
-    """官方 Player 里全部已安装的 GCL 游戏。"""
+    """官方 Player 里全部已安装的 GCL 游戏。结果按 cnf 文件 mtime 缓存。"""
+    path=dmm_dir()/'dmmgame.cnf'
+    try: mtime=path.stat().st_mtime_ns
+    except OSError: return {}
+    key='official:'+str(path)
+    hit=_json_cache.get(key)
+    if hit and hit[0]==mtime: return dict(hit[1])
     result={}
     try:
-        config=json.loads((dmm_dir()/'dmmgame.cnf').read_text(encoding='utf-8'))
+        config=json.loads(path.read_text(encoding='utf-8'))
         for entry in config.get('contents',[]):
             product=entry.get('productId')
             detail=entry.get('detail') or {}
@@ -135,6 +153,7 @@ def official_records():
                              'title':str(detail.get('title') or product)}
     except Exception:
         return {}
+    _json_cache[key]=(mtime,result)
     return result
 
 
@@ -183,7 +202,17 @@ def save_cover(http, product, root, progress=lambda message: None):
 
 def records():
     path = data_dir() / 'games.json'
-    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    if not path.exists(): return {}
+    try: mtime = path.stat().st_mtime_ns
+    except OSError: return {}
+    key = 'records:'+str(path)
+    hit = _json_cache.get(key)
+    if hit and hit[0] == mtime: return dict(hit[1])
+    try: value = json.loads(path.read_text(encoding='utf-8'))
+    except Exception: return {}
+    if not isinstance(value, dict): return {}
+    _json_cache[key] = (mtime, value)
+    return dict(value)
 
 
 def game_root(product):

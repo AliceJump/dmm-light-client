@@ -279,7 +279,7 @@ function applyDetail(data) {
 
 function rowHtml(r, active) {
   return `<div class="row ${active ? 'on' : ''}" data-row="${esc(r.product)}">
-    ${r.cover ? `<img src="${esc(r.cover)}">` : '<img>'}
+    ${r.cover ? `<img loading="lazy" src="${esc(r.cover)}">` : '<img>'}
     <div><div class="t">${esc(r.title)}</div><div class="m">${esc(r.meta)}</div></div>
   </div>`;
 }
@@ -337,7 +337,13 @@ function paneHtml(d) {
 }
 
 /* ---------- 状态 ---------- */
-function setStatus(message) { $('status').textContent = message; const lb = $('logbox'); lb.textContent += message + '\n'; lb.scrollTop = lb.scrollHeight; }
+function setStatus(message) {
+  $('status').textContent = message;
+  const lb = $('logbox');
+  lb.appendChild(document.createTextNode(message + '\n'));   // 追加而非全量重写
+  while (lb.childNodes.length > 800) lb.removeChild(lb.firstChild);
+  lb.scrollTop = lb.scrollHeight;
+}
 function setProgress(p) {
   const bar = $('bar');
   if (!p.active) { bar.classList.remove('live', 'indet'); bar.querySelector('i').style.width = '0'; return; }

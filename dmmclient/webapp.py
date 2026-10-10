@@ -36,15 +36,20 @@ from .theme import system_theme
 WEBUI_DIR = Path(__file__).parent / 'webui'
 
 
-def cover_uri(product):
+def _cover_uri(product, require_file):
     path = cover_path(data_dir(), product) if product else None
-    return path.as_uri() if path and path.is_file() else ''
+    if not path: return ''
+    if require_file and not path.is_file(): return ''
+    return path.as_uri()
+
+
+def cover_uri(product):
+    return _cover_uri(product, True)
 
 
 def cover_base(product):
     """封面规范地址：文件还没下载也先给前端（covers 事件到达后按它补图）。"""
-    path = cover_path(data_dir(), product) if product else None
-    return path.as_uri() if path else ''
+    return _cover_uri(product, False)
 
 
 def uri_of(path):
