@@ -5,8 +5,46 @@ Qt 6.5+ 的 QStyleHints.colorScheme() 会报出系统当前是浅色还是深色
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from pathlib import Path
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QApplication
+
+from .backend.session import data_dir
+
+_ARROWS: dict = {}
+
+
+def chevron_path(theme: str, colors: dict):
+    """生成一张跟随主题色的下拉箭头。
+
+    Qt 的 QSS 不支持用透明边框拼三角（那会画成一个灰方块），
+    所以老老实实画一张 PNG 再让样式表引用。
+    """
+    if theme in _ARROWS:
+        return _ARROWS[theme]
+    path = None
+    try:
+        if QApplication.instance() is None:      # 没有 QApplication 时画不了 QPixmap
+            raise RuntimeError('no QApplication')
+        folder = Path(data_dir()) / 'ui'
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f'chevron-{theme}.png'
+        pixmap = QPixmap(20, 20); pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap); painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(colors['dim'])); pen.setWidthF(1.9)
+        pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(5.5, 8.0), QPointF(10.0, 12.5))
+        painter.drawLine(QPointF(10.0, 12.5), QPointF(14.5, 8.0))
+        painter.end()
+        pixmap.save(str(target), 'PNG')
+        path = target
+    except Exception:
+        path = None
+    _ARROWS[theme] = path
+    return path
 
 DARK = {
     'bg': '#0d0f13', 'surface': '#14171d', 'surface2': '#1a1e26', 'surface3': '#232833',
@@ -44,6 +82,9 @@ def palette(theme: str) -> dict:
 
 def build_style(theme: str) -> str:
     p = palette(theme)
+    arrow = chevron_path(theme, p)
+    arrow_rule = (f"image:url({str(arrow).replace(chr(92), '/')}); width:20px; height:20px;"
+                  if arrow else '')
     return f'''
     QWidget {{ background:{p['bg']}; color:{p['text']}; font-family:{FONT}; font-size:14px; }}
     QLabel {{ background:transparent; }}
@@ -114,13 +155,13 @@ def build_style(theme: str) -> str:
         selection-background-color:{p['accent']}; selection-color:{p['accent_text']}; }}
     QLineEdit:focus, QComboBox:focus {{ border-color:{p['accent']}; }}
     QLineEdit:disabled, QComboBox:disabled {{ color:{p['faint']}; }}
-    QComboBox {{ padding-right:26px; }}
-    QComboBox::drop-down {{ border:none; width:24px; }}
-    QComboBox::down-arrow {{ image:none; border-left:4px solid transparent; border-right:4px solid transparent;
-        border-top:5px solid {p['dim']}; margin-right:10px; }}
+    QComboBox {{ padding-right:30px; }}
+    QComboBox::drop-down {{ border:none; width:30px; }}
+    QComboBox::down-arrow {{ {arrow_rule} }}
     QComboBox QAbstractItemView {{ background:{p['surface']}; border:1px solid {p['border_strong']};
-        border-radius:14px; padding:4px; selection-background-color:{p['accent_soft']};
-        selection-color:{p['accent']}; outline:none; }}
+        border-radius:14px; padding:5px; outline:none;
+        selection-background-color:{p['accent_soft']}; selection-color:{p['accent']}; }}
+    QComboBox QAbstractItemView::item {{ padding:7px 10px; border-radius:8px; min-height:20px; }}
 
     /* 进度条 */
     QProgressBar {{ background:{p['surface3']}; border:none; border-radius:3px; text-align:center;

@@ -19,7 +19,7 @@ from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSiz
 from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QMouseEvent, QPainter,
     QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QScroller, QScrollerProperties, QScrollArea,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
@@ -35,11 +35,6 @@ from .backend.settings import (load_settings, remember_install_base, game_instal
     game_install_root, install_bases)
 from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
 from .theme import build_style, palette, system_theme
-
-
-def divider():
-    line = QFrame(); line.setObjectName('divider'); line.setFrameShape(QFrame.HLine); line.setFixedHeight(1)
-    return line
 
 
 def rounded_pixmap(pixmap, radius=16):
@@ -628,6 +623,8 @@ class Window(QMainWindow):
         self.library_covers = {}   # product -> [QLabel]，随网格重建
         self.store_covers = {}
         self.cover_tried = set()
+        self.library_grid = None     # 建页时才有，resizeEvent 可能先到
+        self.store_grid = None
         self.busy = None            # 内容区遮罩，按需创建
         self.theme = system_theme()
         self.setWindowTitle('DMM Light · 独立客户端')
@@ -680,6 +677,7 @@ class Window(QMainWindow):
         super().resizeEvent(event)
         if self.busy is not None and self.busy.isVisible():
             self.busy.setGeometry(self.tabs.rect())
+        QTimer.singleShot(0, self.fit_grids)
 
     # ---------- 骨架 ----------
 
@@ -738,6 +736,33 @@ class Window(QMainWindow):
         column.addLayout(row)
         return wrap
 
+    @staticmethod
+    def section(title, content):
+        """把一块内容装进卡片：页面用两列排开，别让控件孤零零挤在左上角。"""
+        card = QWidget(); card.setObjectName('card')
+        box = QVBoxLayout(card); box.setContentsMargins(18, 16, 18, 18); box.setSpacing(10)
+        label = QLabel(title); label.setObjectName('section'); box.addWidget(label)
+        box.addWidget(content, 1)
+        return card
+
+    def fit_grids(self):
+        """按视口宽度平均分列，让卡片墙铺满，右边不留一条空白。"""
+        for grid in (self.library_grid, self.store_grid):
+            if grid is None: continue
+            width = grid.viewport().width()
+            if width <= 0: continue
+            columns = max(1, width // (self.CARD_WIDTH + 16))
+            size = QSize(width // columns, self.CARD_HEIGHT + 12)
+            if grid.gridSize() != size: grid.setGridSize(size)   # 相同就别重排，免得来回抖
+
+    def watch_grid(self, grid):
+        """盯住视口尺寸：隐藏页的视口宽度不准，等它显示出来要重算一次列数。"""
+        grid.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize: self.fit_grids()
+        return False
+
     def show_page(self, index, animate=True):
         changed = self.tabs.currentIndex() != index
         snapshot = self.tabs.grab() if (changed and animate and self.isVisible()) else None
@@ -748,6 +773,7 @@ class Window(QMainWindow):
         self.page_title.setText(title); self.page_sub.setText(subtitle)
         self.search.setVisible(index == 1)
         self.top_button.setText('刷新游戏列表' if index == 1 else '刷新')
+        QTimer.singleShot(0, self.fit_grids)
         if snapshot is not None and not snapshot.isNull(): CrossFade(self.tabs, snapshot, 180)
 
     def top_action(self):
@@ -765,7 +791,8 @@ class Window(QMainWindow):
         title = QLabel('全部游戏'); title.setObjectName('section'); head.addWidget(title)
         self.library_count = QLabel(''); self.library_count.setObjectName('muted'); head.addWidget(self.library_count)
         head.addStretch(); box.addLayout(head)
-        self.library_grid = game_grid(); box.addWidget(self.library_grid, 1)
+        self.library_grid = game_grid(); self.watch_grid(self.library_grid)
+        box.addWidget(self.library_grid, 1)
         return page
 
     def build_store_page(self):
@@ -773,63 +800,98 @@ class Window(QMainWindow):
         row = QHBoxLayout(); row.setSpacing(10)
         self.filter_box = QComboBox()
         self.filter_box.addItems(['全部游戏', '一般游戏', 'Fanza R18', '已安装'])
-        self.filter_box.setFixedWidth(150); row.addWidget(self.filter_box); row.addStretch()
+        self.filter_box.setFixedWidth(160); row.addWidget(self.filter_box); row.addStretch()
+        self.store_count = QLabel(''); self.store_count.setObjectName('muted'); row.addWidget(self.store_count)
         box.addLayout(row)
         hint = QLabel('免官方 Player 全新安装；仅支持标准下载型游戏，需要专用安装程序或 DRM 的会明确拒绝。个别游戏要先装 VC++ / DirectX 运行库，客户端会自动下载并运行（可能弹 UAC）。Fanza 游戏需年龄认证账号，与一般版版本各自独立。')
         hint.setObjectName('muted'); hint.setWordWrap(True); box.addWidget(hint)
-        self.store_grid = game_grid(); box.addWidget(self.store_grid, 1)
+        self.store_grid = game_grid(); self.watch_grid(self.store_grid)
+        box.addWidget(self.store_grid, 1)
         self.filter_box.currentIndexChanged.connect(lambda _: self.repopulate_store())
         return page
 
     def build_account_page(self):
-        page = QWidget(); a = QVBoxLayout(page); a.setContentsMargins(28, 24, 28, 24); a.setSpacing(12)
-        title = QLabel('账号管理'); title.setObjectName('section'); a.addWidget(title)
-        hint = QLabel('登录状态加密保存在本客户端的数据目录。登录成功后会自动建档；想保留多份登录态就填编号与名称后点「保存当前账号」。')
-        hint.setObjectName('muted'); hint.setWordWrap(True); a.addWidget(hint)
+        page = QWidget(); grid = QGridLayout(page)
+        grid.setContentsMargins(24, 20, 24, 20); grid.setHorizontalSpacing(18); grid.setVerticalSpacing(18)
+
+        left = QWidget(); a = QVBoxLayout(left); a.setContentsMargins(0, 0, 0, 0); a.setSpacing(10)
         self.account_state = QLabel(''); self.account_state.setObjectName('muted')
         self.account_state.setWordWrap(True); a.addWidget(self.account_state)
-        self.accounts = QComboBox(); a.addWidget(self.accounts)
-        form = QFormLayout(); form.setSpacing(10); self.number = QLineEdit(); self.name = QLineEdit()
-        form.addRow('账号编号', self.number); form.addRow('显示名称', self.name); a.addLayout(form)
-        row = QHBoxLayout(); row.setSpacing(10); a.addLayout(row)
-        self.button(row, '登录新账号', 'new-account'); self.button(row, '保存当前账号', 'save-account')
-        self.button(row, '切换所选账号', 'switch-account'); row.addStretch()
-        a.addWidget(divider())
-        row = QHBoxLayout(); row.setSpacing(10); a.addLayout(row)
-        self.button(row, '浏览器登录 / 续期', 'login'); self.button(row, '导入官方客户端登录态', 'import-login')
-        row.addStretch()
-        hint = QLabel('密码与验证码只在 DMM 官方网页输入。登录成功后复制成功页地址即可返回客户端。')
+        hint = QLabel('密码与验证码只在 DMM 官方网页输入，登录成功后回到客户端即可。')
         hint.setObjectName('muted'); hint.setWordWrap(True); a.addWidget(hint)
-        a.addStretch(); return scrollable_page(page)
+        buttons = QHBoxLayout(); buttons.setSpacing(9); a.addLayout(buttons)
+        self.button(buttons, '浏览器登录 / 续期', 'login'); self.button(buttons, '导入官方登录态', 'import-login')
+        buttons.addStretch()
+        buttons = QHBoxLayout(); buttons.setSpacing(9); a.addLayout(buttons)
+        self.button(buttons, '登录新账号', 'new-account'); buttons.addStretch()
+        a.addStretch()
+        grid.addWidget(self.section('当前登录', left), 0, 0, Qt.AlignTop)
+
+        right = QWidget(); b = QVBoxLayout(right); b.setContentsMargins(0, 0, 0, 0); b.setSpacing(10)
+        self.accounts = QComboBox(); b.addWidget(self.accounts)
+        form = QFormLayout(); form.setSpacing(10); self.number = QLineEdit(); self.name = QLineEdit()
+        form.addRow('账号编号', self.number); form.addRow('显示名称', self.name); b.addLayout(form)
+        buttons = QHBoxLayout(); buttons.setSpacing(9); b.addLayout(buttons)
+        self.button(buttons, '保存当前账号', 'save-account'); self.button(buttons, '切换所选账号', 'switch-account')
+        buttons.addStretch()
+        hint = QLabel('同一编号再保存一次即为改名；切换只替换登录态文件，正在运行的游戏不受影响。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); b.addWidget(hint)
+        b.addStretch()
+        grid.addWidget(self.section('账号列表', right), 0, 1, Qt.AlignTop)
+
+        self.storage_state = QLabel(''); self.storage_state.setObjectName('muted')
+        self.storage_state.setWordWrap(True)
+        grid.addWidget(self.section('本地存储', self.storage_state), 1, 0, 1, 2, Qt.AlignTop)
+        grid.setRowStretch(2, 1)
+
+        return scrollable_page(page)
 
     def build_network_page(self):
-        page = QWidget(); n = QVBoxLayout(page); n.setContentsMargins(28, 24, 28, 24); n.setSpacing(12)
-        title = QLabel('代理与节点'); title.setObjectName('section'); n.addWidget(title)
+        page = QWidget(); grid = QGridLayout(page)
+        grid.setContentsMargins(24, 20, 24, 20); grid.setHorizontalSpacing(18); grid.setVerticalSpacing(18)
+
+        left = QWidget(); n = QVBoxLayout(left); n.setContentsMargins(0, 0, 0, 0); n.setSpacing(10)
         self.mode = QComboBox(); self.mode.addItems(['内置 Xray 节点池', '外部代理地址'])
         self.mode.setCurrentIndex(0 if self.settings[NODE_ENABLED_KEY] else 1); n.addWidget(self.mode)
-        self.proxy = QLineEdit(self.settings['proxy']); self.proxy.setPlaceholderText('http://127.0.0.1:10808 或 socks5h://127.0.0.1:10808'); n.addWidget(self.proxy)
+        self.proxy = QLineEdit(self.settings['proxy'])
+        self.proxy.setPlaceholderText('http://127.0.0.1:10808 或 socks5h://127.0.0.1:10808'); n.addWidget(self.proxy)
         hint = QLabel('外部代理也用于首次下载 Xray 内核；已有内核时，内置模式不依赖 v2rayN。')
         hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
-        row = QHBoxLayout(); row.setSpacing(10); n.addLayout(row)
-        self.button(row, '保存代理设置', 'settings'); self.button(row, '测试 DMM 连接', 'test'); row.addStretch()
+        buttons = QHBoxLayout(); buttons.setSpacing(9); n.addLayout(buttons)
+        self.button(buttons, '保存代理设置', 'settings'); self.button(buttons, '测试 DMM 连接', 'test')
+        buttons.addStretch()
         self.sysproxy = QPushButton('开启系统代理（给本机浏览器临时用）'); self.sysproxy.setCheckable(True)
         self.sysproxy.toggled.connect(self.toggle_system_proxy); n.addWidget(self.sysproxy)
         hint = QLabel('开启后本机浏览器经本客户端节点访问 DMM（用于商店加库）；关闭软件或再点一次即还原。')
         hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
-        self.nodes = QComboBox(); n.addWidget(self.nodes)
+        n.addStretch()
+        grid.addWidget(self.section('代理', left), 0, 0, Qt.AlignTop)
+
+        right = QWidget(); m = QVBoxLayout(right); m.setContentsMargins(0, 0, 0, 0); m.setSpacing(10)
+        self.nodes = QComboBox(); m.addWidget(self.nodes)
         self.node_text = QLineEdit(); self.node_text.setEchoMode(QLineEdit.EchoMode.Password)
-        self.node_text.setPlaceholderText('粘贴节点分享链接或单节点 Xray JSON，内容隐藏'); n.addWidget(self.node_text)
-        row = QHBoxLayout(); row.setSpacing(10); n.addLayout(row)
-        self.button(row, '添加节点', 'import-node'); self.button(row, '导入 JSON 文件', 'node-file'); row.addStretch()
-        hint = QLabel('最多 32 个节点，轮换使用，连接失败自动尝试下一节点。\n浏览器登录使用 HTTP 代理或内置节点池；SOCKS5 支持 API、更新和下载。')
-        hint.setObjectName('muted'); hint.setWordWrap(True); n.addWidget(hint)
-        n.addStretch(); return scrollable_page(page)
+        self.node_text.setPlaceholderText('粘贴节点分享链接或单节点 Xray JSON，内容隐藏'); m.addWidget(self.node_text)
+        buttons = QHBoxLayout(); buttons.setSpacing(9); m.addLayout(buttons)
+        self.button(buttons, '添加节点', 'import-node'); self.button(buttons, '导入 JSON 文件', 'node-file')
+        buttons.addStretch()
+        hint = QLabel('最多 32 个节点，轮换使用，连接失败自动尝试下一节点。\n'
+                      '浏览器登录使用 HTTP 代理或内置节点池；SOCKS5 支持 API、更新和下载。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); m.addWidget(hint)
+        m.addStretch()
+        grid.addWidget(self.section('节点', right), 0, 1, Qt.AlignTop)
+
+        self.network_state = QLabel(''); self.network_state.setObjectName('muted')
+        self.network_state.setWordWrap(True)
+        grid.addWidget(self.section('当前状态', self.network_state), 1, 0, 1, 2, Qt.AlignTop)
+        grid.setRowStretch(2, 1)
+
+        return scrollable_page(page)
 
     # ---------- 卡片 ----------
 
-    CARD_WIDTH = 178
-    CARD_HEIGHT = 338
-    COVER_SIZE = 158
+    CARD_WIDTH = 170
+    CARD_HEIGHT = 330
+    COVER_SIZE = 150
 
     def make_card(self, grid, buttons, covers, product, title, state, card_buttons, extra=()):
         card = QWidget(); card.setObjectName('card')
@@ -950,6 +1012,7 @@ class Window(QMainWindow):
                 f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}", buttons))
         self._restore_scroll(self.library_grid, offset)
         self.library_grid.setUpdatesEnabled(True)
+        self.fit_grids()
 
     def repopulate_store(self, keep_scroll=False):
         offset = self.store_grid.verticalScrollBar().value() if keep_scroll else 0
@@ -980,6 +1043,7 @@ class Window(QMainWindow):
                 self.store_covers, product, title, state, buttons))
         self._restore_scroll(self.store_grid, offset)
         self.store_grid.setUpdatesEnabled(True)
+        self.store_count.setText(f'{self.store_grid.count()} 款')
 
     # ---------- 刷新与封面 ----------
 
@@ -1008,6 +1072,13 @@ class Window(QMainWindow):
                     if node['enabled']: enabled += 1
                     self.nodes.addItem(node['name'] + (' · 已启用' if node['enabled'] else ' · 已停用'), node['id'])
             self.node_chip.setText(f'{enabled} 个节点可用' if enabled else '没有可用节点')
+            self.storage_state.setText(
+                f'数据目录：{data_dir()}\n'
+                f'登录态文件：{"已存在" if (data_dir() / "session.dpapi").exists() else "不存在"}\n'
+                f'已保存账号：{len(value["accounts"])} 个')
+            self.network_state.setText(
+                f'生效代理：{self.settings.get("proxy", "")}\n'
+                f'可用节点：{enabled} 个')
         except DmmError as error:
             self.status.setText(str(error))
         except Exception:
