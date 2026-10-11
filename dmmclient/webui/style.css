@@ -148,9 +148,18 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
                   to{opacity:1;transform:none}}
 /* 截图灯箱 */
 .lightbox{position:fixed;inset:0;z-index:99;display:flex;align-items:center;justify-content:center;
-      background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(8px);cursor:zoom-out}
-.lightbox img{max-width:92vw;max-height:92vh;border-radius:var(--r-lg);
-      box-shadow:0 24px 80px rgba(0,0,0,.5);animation:paneIn .25s var(--ease-out)}
+      gap:16px;background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(8px)}
+.lightbox img{max-width:82vw;max-height:92vh;border-radius:var(--r-lg);
+      box-shadow:0 24px 80px rgba(0,0,0,.5);animation:paneIn .25s var(--ease-out);
+      background:var(--surface-3);min-width:220px;min-height:140px}
+.lightbox .lb-nav{width:46px;height:64px;font-size:30px;line-height:1;color:var(--text);
+      background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);
+      cursor:pointer;flex:none;opacity:.85}
+.lightbox .lb-nav:hover{background:var(--surface-3);opacity:1}
+.lightbox .lb-nav.hidden{display:none}
+.lightbox .lb-count{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
+      font-size:12.5px;color:var(--dim);background:var(--surface);border:1px solid var(--border);
+      border-radius:99px;padding:5px 14px}
 .pane .shots img{cursor:zoom-in}
 @keyframes detailIn{from{opacity:0;transform:translateX(28px) scale(.98);filter:blur(6px)}
                     to{opacity:1;transform:none;filter:none}}

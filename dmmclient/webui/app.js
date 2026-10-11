@@ -275,6 +275,7 @@ function applyDetail(data) {
   if (!data.open) return;                    // 只是缓存数据，不开视图
   renderGameLib();
   if (currentPage !== 'gamelib') showPage('gamelib');
+  if (!lightbox.classList.contains('hidden')) updateLightbox();   // 大图补抓完成后灯箱自动换成新图
 }
 
 function rowHtml(r, active) {
@@ -451,20 +452,65 @@ document.addEventListener('change', ev => {
   if (ev.target.id === 'sysproxy') call('system-proxy', {on: ev.target.checked});
 });
 
-/* 截图灯箱：点开放大，点击任意处或 Esc 关闭 */
+/* 截图灯箱：点开放大；←/→ 或按钮切换；点击背景或 Esc 关闭。
+   灯箱打开期间详情刷新（大图后台补抓完成）会自动跟随换成最新大图。 */
 const lightbox = $('lightbox');
+let lightboxIndex = -1;
+
+function lightboxShots() {
+  return (detail && detail.shots) || [];
+}
+
+function updateLightbox() {
+  const shots = lightboxShots();
+  if (lightboxIndex < 0 || lightboxIndex >= shots.length) { closeLightbox(); return; }
+  const shot = shots[lightboxIndex];
+  lightbox.querySelector('img').src = (shot && shot.f) || shot || '';
+  lightbox.querySelector('.lb-count').textContent =
+    shots.length > 1 ? `${lightboxIndex + 1} / ${shots.length}` : '';
+  const single = shots.length < 2;
+  lightbox.querySelector('.lb-prev').classList.toggle('hidden', single);
+  lightbox.querySelector('.lb-next').classList.toggle('hidden', single);
+}
+
+function openLightbox(index) {
+  lightboxIndex = index;
+  updateLightbox();
+  lightbox.classList.remove('hidden');
+}
+
+function closeLightbox() {
+  lightboxIndex = -1;
+  lightbox.classList.add('hidden');
+  lightbox.querySelector('img').removeAttribute('src');
+}
+
+function stepLightbox(delta) {
+  const shots = lightboxShots();
+  if (!shots.length) return;
+  lightboxIndex = (lightboxIndex + delta + shots.length) % shots.length;
+  updateLightbox();
+}
+
 document.addEventListener('click', ev => {
   const shot = ev.target.closest('.pane .shots img');
   if (shot) {
-    lightbox.querySelector('img').src = shot.dataset.full || shot.currentSrc || shot.src;
-    lightbox.classList.remove('hidden');
+    const images = [...document.querySelectorAll('.pane .shots img')];
+    openLightbox(images.indexOf(shot));
     return;
   }
-  if (ev.target.closest('#lightbox')) lightbox.classList.add('hidden');
+  if (ev.target.closest('#lightbox')) {
+    if (ev.target.closest('[data-lb=prev]')) { stepLightbox(-1); return; }
+    if (ev.target.closest('[data-lb=next]')) { stepLightbox(1); return; }
+    closeLightbox();   // 点图片或背景关闭
+    return;
+  }
 });
 document.addEventListener('keydown', ev => {
-  if (ev.key === 'Escape' && !lightbox.classList.contains('hidden'))
-    lightbox.classList.add('hidden');
+  if (lightbox.classList.contains('hidden')) return;
+  if (ev.key === 'Escape') closeLightbox();
+  if (ev.key === 'ArrowLeft') stepLightbox(-1);
+  if (ev.key === 'ArrowRight') stepLightbox(1);
 });
 
 /* ---------- 启动 ---------- */
