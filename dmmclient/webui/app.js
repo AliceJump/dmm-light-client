@@ -254,18 +254,15 @@ function listRows() {
 }
 
 function renderGameLib() {
-  patchGamelist($('gamelist'), listRows(), detail ? detail.product : '');
   if (!detail) {
     renderIfChanged('pane', 'empty', () => {
+      paneProduct = '';
       $('gamedetail').innerHTML = '<p class="muted">从左侧选择一款游戏查看详情</p>';
     });
     return;
   }
-  const d = detail;
-  patchGamelist($('gamelist'), listRows(), d.product);
-  const sig = JSON.stringify([d.product, d.title, d.stateLine, d.root, d.buttons, d.shots,
-    d.description, d.info, d.specs, d.captions, d.links, d.loading, d.coverBase]);
-  renderIfChanged('pane', sig, () => { $('gamedetail').outerHTML = paneHtml(d); });
+  renderPane(detail);
+  patchGamelist($('gamelist'), listRows(), detail.product);
 }
 
 function applyDetail(data) {
@@ -310,9 +307,15 @@ function patchGamelist(container, rows, current) {
   existing.forEach((el, product) => { if (!seen.has(product)) el.remove(); });
 }
 
-function paneHtml(d) {
-  return `<div class="pane" id="gamedetail">
-      <div class="block"><div class="detail-head">
+/* ---------- 详情 pane：按块增量渲染 ----------
+   每个部分（头部/截图/简介/信息/环境/注意/链接/加载中）独立签名独立更新：
+   数据一点一点到，就一点一点加；已显示的块内容没变就完全不碰 DOM。 */
+const PANE_ORDER = ['head', 'shots', 'desc', 'info', 'specs', 'capt', 'links', 'loading', 'note'];
+let paneProduct = '';
+
+function paneBlocks(d) {
+  const b = {};
+  b.head = `<div class="block" data-block="head"><div class="detail-head">
         ${d.cover ? `<img class="big" src="${esc(d.cover)}">` : ''}
         <div class="col">
           <h3>${esc(d.title)}</h3>
@@ -321,21 +324,78 @@ function paneHtml(d) {
           ${d.root ? `<div class="kv"><span class="k">目录</span><span class="v">${esc(d.root)}</span></div>` : ''}
           <div class="kv"><span class="k">编号</span><span class="v">${esc(d.product)}</span></div>
         </div></div>
-        <div class="links-row" style="margin-top:14px">${(d.buttons || []).map(b => buttonHtml(b, d.product)).join('')}</div>
-      </div>
-      ${(d.shots && d.shots.length) ? `<div class="block"><h4>截图</h4><div class="shots">${d.shots.map(s =>
-        `<img loading="lazy" src="${esc(s.t || s)}" data-full="${esc(s.f || s.t || s)}">`).join('')}</div></div>` : ''}
-      ${d.description ? `<div class="block"><h4>简介</h4><div class="desc">${esc(d.description)}</div></div>` : ''}
-      ${(d.info && d.info.length) ? `<div class="block"><h4>游戏信息</h4><div class="specgrid">${d.info.map(i =>
-        `<span class="k">${esc(i.key)}</span><span class="v" style="user-select:text">${esc(i.value)}</span>`).join('')}</div></div>` : ''}
-      ${(d.specs || []).filter(s => s.html).map(s =>
-        `<div class="block"><h4>运行环境（${esc(s.os || 'Windows')}）</h4><div class="desc" style="user-select:text">${esc(s.html)}</div></div>`).join('')}
-      ${(d.captions && d.captions.length) ? `<div class="block"><h4>注意事项</h4><div class="capt">${d.captions.map(c => '· ' + esc(c)).join('<br>')}</div></div>` : ''}
-      ${(d.links && d.links.length) ? `<div class="block"><h4>相关链接</h4><div class="links-row">${d.links.map(l =>
-        `<button class="btn" data-url="${esc(l.url)}">${esc(l.text || '打开')}</button>`).join('')}</div></div>` : ''}
-      ${d.loading ? '<div class="loading">正在获取商店信息（简介 / 截图 / 运行环境）…</div>' : ''}
-      <p class="note">${esc(d.note || '')}</p>
-    </div>`;
+        <div class="links-row" style="margin-top:14px">${(d.buttons || []).map(x => buttonHtml(x, d.product)).join('')}</div>
+      </div>`;
+  b.shots = (d.shots && d.shots.length)
+    ? `<div class="block" data-block="shots"><h4>截图</h4><div class="shots">${d.shots.map(s =>
+        `<img loading="lazy" src="${esc(s.t || s)}" data-full="${esc(s.f || s.t || s)}">`).join('')}</div></div>` : '';
+  b.desc = d.description
+    ? `<div class="block" data-block="desc"><h4>简介</h4><div class="desc">${esc(d.description)}</div></div>` : '';
+  b.info = (d.info && d.info.length)
+    ? `<div class="block" data-block="info"><h4>游戏信息</h4><div class="specgrid">${d.info.map(i =>
+        `<span class="k">${esc(i.key)}</span><span class="v" style="user-select:text">${esc(i.value)}</span>`).join('')}</div></div>` : '';
+  const specs = (d.specs || []).filter(s => s.html);
+  b.specs = specs.length
+    ? `<div data-block="specs">${specs.map(s =>
+        `<div class="block"><h4>运行环境（${esc(s.os || 'Windows')}）</h4><div class="desc" style="user-select:text">${esc(s.html)}</div></div>`).join('')}</div>` : '';
+  b.capt = (d.captions && d.captions.length)
+    ? `<div class="block" data-block="capt"><h4>注意事项</h4><div class="capt">${d.captions.map(c => '· ' + esc(c)).join('<br>')}</div></div>` : '';
+  b.links = (d.links && d.links.length)
+    ? `<div class="block" data-block="links"><h4>相关链接</h4><div class="links-row">${d.links.map(l =>
+        `<button class="btn" data-url="${esc(l.url)}">${esc(l.text || '打开')}</button>`).join('')}</div></div>` : '';
+  b.loading = d.loading
+    ? `<div class="block" data-block="loading"><div class="loading">正在获取商店信息（简介 / 截图 / 运行环境）…</div></div>` : '';
+  b.note = d.note ? `<p class="note" data-block="note">${esc(d.note)}</p>` : '';
+  return b;
+}
+
+function paneBlockSig(key, d) {
+  return JSON.stringify(key === 'head' ? [d.product, d.cover, d.title, d.chips, d.stateLine, d.root, d.buttons]
+    : key === 'shots' ? [d.shots]
+    : key === 'desc' ? [d.description]
+    : key === 'info' ? [d.info]
+    : key === 'specs' ? [d.specs]
+    : key === 'capt' ? [d.captions]
+    : key === 'links' ? [d.links]
+    : key === 'loading' ? [d.loading]
+    : [d.note]);
+}
+
+function replaceBlock(pane, key, html) {
+  const existing = pane.querySelector(`[data-block="${key}"]`);
+  if (!html) { if (existing) existing.remove(); return; }
+  if (existing) { existing.outerHTML = html; return; }
+  const after = PANE_ORDER.slice(PANE_ORDER.indexOf(key) + 1)
+    .map(k => pane.querySelector(`[data-block="${k}"]`)).find(Boolean);
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html.trim();
+  const node = tpl.content.firstElementChild;
+  if (after) pane.insertBefore(node, after); else pane.appendChild(node);
+}
+
+function renderPane(d) {
+  const pane = $('gamedetail');
+  if (paneProduct !== d.product) {
+    paneProduct = d.product;                       // 切游戏：整栏重建（带入场动画）
+    const blocks = paneBlocks(d);
+    if (sigs['pane:' + d.product] !== 'full') {
+      sigs['pane:' + d.product] = 'full';
+      pane.outerHTML = `<div class="pane" id="gamedetail">${PANE_ORDER.map(k => blocks[k]).join('')}</div>`;
+    }
+    // 整建后同步各块签名，否则下一次数据到达会把所有块当「变化」全部重建
+    PANE_ORDER.forEach(key => { sigs[`pane:${d.product}:${key}`] = paneBlockSig(key, d); });
+    return;
+  }
+  const blocks = paneBlocks(d);
+  PANE_ORDER.forEach(key => {
+    renderIfChanged('pane:' + d.product + ':' + key, paneBlockSig(key, d),
+      () => replaceBlock(pane, key, blocks[key]));
+  });
+}
+
+function paneHtml(d) {   // 保留旧名以防其他调用点；等价于整栏重建
+  const blocks = paneBlocks(d);
+  return `<div class="pane" id="gamedetail">${PANE_ORDER.map(k => blocks[k]).join('')}</div>`;
 }
 
 /* ---------- 状态 ---------- */
