@@ -1,6 +1,6 @@
 [project]
 name = "dmm-light-client"
-version = "0.1.0"
+version = "1.0.0"
 description = "Independent Windows DMM client prototype"
 requires-python = ">=3.12"
 dependencies = ["PySide6>=6.8,<7", "requests[socks]>=2.32,<3", "psutil>=6", "pywin32>=306", "pycryptodome>=3.23,<4"]
