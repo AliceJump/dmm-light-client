@@ -183,26 +183,34 @@ class WebWindow(QMainWindow):
 
     def library_cards(self):
         installed = {**official_records(), **records()}
+        helper_root = None
         try:
-            _, version = DmmHelper.installed_game()
+            helper_root, version = DmmHelper.installed_game()
             state = f'已安装 · 版本 {version}'
         except DmmError:
             state = '未识别官方安装记录'
+        if not helper_root:
+            try: helper_root = json.loads((data_dir() / 'installation.json').read_text(encoding='utf-8')).get('root')
+            except Exception: helper_root = None
+        gakumas_buttons = [{'t': '启动', 'a': 'launch', 'pri': True},
+                           {'t': '检查', 'a': 'check'}, {'t': '更新', 'a': 'update'}]
+        if helper_root and Path(helper_root).exists():
+            gakumas_buttons.append({'t': '打开目录', 'a': 'open-dir'})
+        else:
+            gakumas_buttons.append({'t': '选择游戏目录', 'a': 'game-folder'})
         cards = [{'product': 'gakumas', 'title': '学园偶像大师', 'state': state,
                   'badges': self.card_badges(state), 'cover': cover_uri('gakumas'),
-                  'coverBase': cover_base('gakumas'),
-                  'buttons': [{'t': '启动', 'a': 'launch', 'pri': True},
-                              {'t': '检查', 'a': 'check'}, {'t': '更新', 'a': 'update'},
-                              {'t': '选择游戏目录', 'a': 'game-folder'}]}]
+                  'coverBase': cover_base('gakumas'), 'buttons': gakumas_buttons}]
         titles = self.known_titles()
         for product, value in sorted(installed.items()):
             if product == 'gakumas': continue
             managed = product in records()
             origin = '' if managed else '官方 Player 安装 · '
             buttons = [{'t': '启动', 'a': 'game-launch', 'pri': True},
-                       {'t': '检查', 'a': 'game-check'}, {'t': '更新', 'a': 'game-update'}]
+                       {'t': '检查', 'a': 'game-check'}, {'t': '更新', 'a': 'game-update'},
+                       {'t': '打开目录', 'a': 'open-dir'}]
             if managed:
-                buttons += [{'t': '目录', 'a': 'game-dir'}, {'t': '卸载', 'a': 'game-uninstall', 'danger': True}]
+                buttons += [{'t': '移动', 'a': 'game-dir'}, {'t': '卸载', 'a': 'game-uninstall', 'danger': True}]
             state = f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}"
             cards.append({'product': product, 'title': titles.get(product, product), 'state': state,
                           'badges': self.card_badges(state), 'cover': cover_uri(product),
@@ -220,9 +228,10 @@ class WebWindow(QMainWindow):
             badge = 'Fanza R18 · ' if product in adult else ''
             buttons = []
             if record:
-                buttons = [{'t': '启动', 'a': 'game-launch', 'pri': True}, {'t': '更新', 'a': 'game-update'}]
+                buttons = [{'t': '启动', 'a': 'game-launch', 'pri': True}, {'t': '更新', 'a': 'game-update'},
+                           {'t': '打开目录', 'a': 'open-dir'}]
                 if product in records():
-                    buttons += [{'t': '目录', 'a': 'game-dir'}, {'t': '卸载', 'a': 'game-uninstall', 'danger': True}]
+                    buttons += [{'t': '移动', 'a': 'game-dir'}, {'t': '卸载', 'a': 'game-uninstall', 'danger': True}]
                 buttons.append({'t': '详情', 'a': 'detail-open'})
                 state = badge + f"已安装 · 版本 {record.get('version', '未知')}{self.version_note(product)}"
             else:
@@ -245,7 +254,7 @@ class WebWindow(QMainWindow):
         buttons = ([{'t': '启动游戏', 'a': 'launch', 'pri': True}, {'t': '检查更新', 'a': 'check'},
                     {'t': '选择目录', 'a': 'game-folder'}] if product == 'gakumas' else
                    [{'t': '启动游戏', 'a': 'game-launch', 'pri': True}, {'t': '检查更新', 'a': 'game-check'},
-                    {'t': '打开目录', 'a': 'game-dir'}])
+                    {'t': '打开目录', 'a': 'open-dir'}])
         return {'product': product, 'title': self.known_titles().get(product, product),
                 'meta': f"已安装 · 版本 {version}{self.version_note(product)}",
                 'cover': cover_uri(product), 'coverBase': cover_base(product), 'buttons': buttons}
@@ -322,8 +331,9 @@ class WebWindow(QMainWindow):
         if record:
             state_line = f"已安装 · 版本 {self.installed_version(product, record.get('version', '未知'))}{self.version_note(product)}"
             buttons = [{'t': '启动', 'a': 'game-launch', 'pri': True}, {'t': '检查更新', 'a': 'game-check'},
-                       {'t': '更新', 'a': 'game-update'}, {'t': '目录', 'a': 'game-dir'},
-                       {'t': '卸载', 'a': 'game-uninstall', 'danger': True}]
+                       {'t': '更新', 'a': 'game-update'}, {'t': '打开目录', 'a': 'open-dir'}]
+            if product in records():
+                buttons += [{'t': '移动', 'a': 'game-dir'}, {'t': '卸载', 'a': 'game-uninstall', 'danger': True}]
             note = '版本由后台清单校验自动纠正；游戏自己更新过也会显示正确版本。'
         else:
             state_line = '未安装'
@@ -540,6 +550,8 @@ class WebWindow(QMainWindow):
             with helper_lock(data_dir()):
                 atomic_write(data_dir() / 'installation.json', json.dumps({'root': str(root), 'version': '未知'}).encode())
             self.push_snapshot(); self.report('游戏目录已保存'); return
+        if action == 'open-dir':
+            self.open_game_folder(product); return
         if action == 'game-dir':
             self.choose_game_directory(product); return
         if action == 'game-uninstall':
@@ -655,6 +667,22 @@ class WebWindow(QMainWindow):
         if base is None: return None
         remember_install_base(product, base)
         return base / product
+
+    def open_game_folder(self, product):
+        """用资源管理器打开游戏安装目录（gakumas 走专用记录）。"""
+        root = None
+        if product == 'gakumas':
+            try: root = DmmHelper.installed_game()[0]
+            except DmmError: root = None
+            if not root:
+                try: root = json.loads((data_dir() / 'installation.json').read_text(encoding='utf-8')).get('root')
+                except Exception: root = None
+        else:
+            root = (installed_record(product) or {}).get('root')
+        if not root or not Path(root).exists():
+            self.report('没有找到该游戏的安装目录'); return
+        os.startfile(str(Path(root)))
+        self.report(f'已打开目录：{root}')
 
     def choose_game_directory(self, product):
         title = self.known_titles().get(product, product)

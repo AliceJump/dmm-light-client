@@ -1181,23 +1181,30 @@ class Window(QMainWindow):
         self.library_grid.setUpdatesEnabled(False)   # 重建期间别重绘，否则会先闪一下空白
         self.library_grid.clear(); self.library_buttons = []; self.library_covers = {}
         installed = {**official_records(), **records()}
+        helper_root = None
         try:
-            _, version = DmmHelper.installed_game()
+            helper_root, version = DmmHelper.installed_game()
             state = f'已安装 · 版本 {version}'
         except DmmError:
             state = '未识别官方安装记录'
+        if not helper_root:
+            try: helper_root = json.loads((data_dir() / 'installation.json').read_text(encoding='utf-8')).get('root')
+            except Exception: helper_root = None
+        gakumas_extra = [('打开目录', 'open-dir', False)] if helper_root and Path(helper_root).exists() \
+            else [('选择游戏目录', 'game-folder', False)]
         self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
             self.library_covers, 'gakumas', '学园偶像大师', state,
             [('启动', 'launch', True), ('检查', 'check', False), ('更新', 'update', False)],
-            extra=[('选择游戏目录', 'game-folder', False)]))
+            extra=gakumas_extra))
         titles = self.known_titles()
         for product, value in sorted(installed.items()):
             if product == 'gakumas': continue  # 学园偶像大师固定为第一张卡片
             title = titles.get(product, product)
             managed = product in records()
             origin = '' if managed else '官方 Player 安装 · '
-            buttons = [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False)]
-            if managed: buttons += [('目录', 'game-dir', False), ('卸载', 'game-uninstall', False)]
+            buttons = [('启动', 'game-launch', True), ('检查', 'game-check', False), ('更新', 'game-update', False),
+                       ('打开目录', 'open-dir', False)]
+            if managed: buttons += [('移动', 'game-dir', False), ('卸载', 'game-uninstall', False)]
             self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
                 self.library_covers, product, title,
                 f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}", buttons))
@@ -1223,13 +1230,13 @@ class Window(QMainWindow):
             record = installed.get(product)
             badge = 'Fanza R18 · ' if product in adult else ''
             if record:
-                buttons = [('启动', 'game-launch', True), ('更新', 'game-update', False)]
-                if product in records(): buttons += [('目录', 'game-dir', False), ('卸载', 'game-uninstall', False)]
+                buttons = [('启动', 'game-launch', True), ('更新', 'game-update', False), ('打开目录', 'open-dir', False)]
+                if product in records(): buttons += [('移动', 'game-dir', False), ('卸载', 'game-uninstall', False)]
                 buttons.append(('详情', 'detail-open', False))
                 state = badge + f"已安装 · 版本 {record.get('version', '未知')}{self.version_note(product)}"
             else:
                 state = badge + '未安装 · 可全新安装'
-                buttons = [('全新安装', 'game-update', True), ('目录', 'game-dir', False), ('详情', 'detail-open', False)]
+                buttons = [('全新安装', 'game-update', True), ('安装位置', 'game-dir', False), ('详情', 'detail-open', False)]
             self.add_card(self.store_grid, self.make_card(self.store_grid, self.store_buttons,
                 self.store_covers, product, title, state, buttons))
         self._restore_scroll(self.store_grid, offset)
@@ -1302,7 +1309,7 @@ class Window(QMainWindow):
                            self.cover_pixmap(product))
         spec = ([('启动游戏', 'launch', True), ('检查更新', 'check', False), ('选择目录', 'game-folder', False)]
                 if product == 'gakumas' else
-                [('启动游戏', 'game-launch', True), ('检查更新', 'game-check', False), ('打开目录', 'game-dir', False)])
+                [('启动游戏', 'game-launch', True), ('检查更新', 'game-check', False), ('打开目录', 'open-dir', False)])
         for text, action, accent in spec:
             button = QPushButton(text); button.setCursor(Qt.PointingHandCursor)
             if accent: button.setProperty('accent', True)
@@ -1558,9 +1565,13 @@ class Window(QMainWindow):
         box.addLayout(head)
 
         actions = QHBoxLayout(); actions.setSpacing(9)
+        managed = product in records()
         spec = ([('启动', 'game-launch', True), ('检查更新', 'game-check', False), ('更新', 'game-update', False),
-                 ('目录', 'game-dir', False), ('卸载', 'game-uninstall', False)] if record else
-                [('全新安装', 'game-update', True), ('选择目录', 'game-dir', False)])
+                 ('打开目录', 'open-dir', False),
+                 ('移动', 'game-dir', False), ('卸载', 'game-uninstall', False)] if managed else
+                ([('启动', 'game-launch', True), ('检查更新', 'game-check', False), ('更新', 'game-update', False),
+                  ('打开目录', 'open-dir', False)] if record else
+                 [('全新安装', 'game-update', True)]))
         for text, action, accent in spec:
             button = QPushButton(text); button.setCursor(Qt.PointingHandCursor)
             if action == 'game-uninstall':
@@ -1744,6 +1755,22 @@ class Window(QMainWindow):
         else:
             restore_system_proxy(); self.report('系统代理已恢复原设置')
 
+    def open_game_folder(self, product):
+        """用资源管理器打开游戏安装目录（gakumas 走专用记录）。"""
+        root = None
+        if product == 'gakumas':
+            try: root = DmmHelper.installed_game()[0]
+            except DmmError: root = None
+            if not root:
+                try: root = json.loads((data_dir() / 'installation.json').read_text(encoding='utf-8')).get('root')
+                except Exception: root = None
+        else:
+            root = (installed_record(product) or {}).get('root')
+        if not root or not Path(root).exists():
+            self.status.setText('没有找到该游戏的安装目录'); return
+        os.startfile(str(Path(root)))
+        self.status.setText(f'已打开目录：{root}')
+
     def run_action(self, action, product=''):
         try:
             # 打开详情与保存代理设置不与其他操作冲突，任何时候都立即执行
@@ -1757,6 +1784,8 @@ class Window(QMainWindow):
                 with helper_lock(data_dir()):
                     atomic_write(data_dir() / 'installation.json', json.dumps({'root':str(root),'version':'未知'}).encode())
                 self.refresh(); self.report('游戏目录已保存'); return
+            if action == 'open-dir':
+                self.open_game_folder(product); return
             if action == 'game-dir':
                 self.choose_game_directory(product); return
             if action == 'game-uninstall':

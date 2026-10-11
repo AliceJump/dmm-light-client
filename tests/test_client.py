@@ -169,7 +169,7 @@ class ClientTests(unittest.TestCase):
             (data_dir() / 'catalog.json').write_text(json.dumps([
                 {'product': 'umamusume', 'title': 'Uma', 'adult': False, 'link': ''}]), encoding='utf-8')
             window = Window()
-            self.assertIn('目录', [button.text() for button in window.store_buttons])
+            self.assertIn('安装位置', [button.text() for button in window.store_buttons])
             with patch('dmmclient.app.QFileDialog.getExistingDirectory', return_value=target):
                 location = window.ensure_install_location('umamusume')
             self.assertEqual(location, Path(target).resolve() / 'umamusume')
@@ -281,7 +281,7 @@ class ClientTests(unittest.TestCase):
             window = Window()
             labels = [button.text() for button in window.library_buttons]
             self.assertIn('卸载', labels)
-            self.assertIn('目录', labels)
+            self.assertIn('移动', labels)
             window.close(); window.deleteLater(); app.processEvents()
 
     def test_refresh_keeps_card_wall_scroll_position(self):
