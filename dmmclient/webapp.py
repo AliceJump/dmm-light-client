@@ -56,6 +56,35 @@ def uri_of(path):
     return Path(path).as_uri() if path else ''
 
 
+def _id_stem(product):
+    """去掉可执行后缀：'aigisr_exe' -> ('aigisr', '_exe')，'tskx' -> ('tskx', '')。"""
+    for suf in ('_exe', 'exe'):
+        if product.endswith(suf) and len(product) > len(suf):
+            return product[:-len(suf)], suf
+    return product, ''
+
+
+def variant_other(product):
+    """普通版/R18 版互查（纯 id 规则）：R18 是普通版 id 加 r/x（或 _r/_x）尾巴。
+    返回另一版本的 id，不存在或自身不在目录时返回 None。"""
+    entries = {item['product']: item for item in catalog()}
+    if product not in entries: return None
+    adult = bool(entries[product].get('adult'))
+    stem, suf = _id_stem(product)
+    candidates = []
+    if adult:      # R18 -> 普通：剥掉 r/x 尾
+        for tail in ('_r', '_x', '-r', '-x', 'r', 'x'):
+            if stem.endswith(tail):
+                candidates.append(stem[:-len(tail)] + suf)
+    else:          # 普通 -> R18：尝试加尾
+        for tail in ('_r', '_x', '-r', '-x', 'r', 'x'):
+            candidates.append(stem + tail + suf)
+    for cand in candidates:
+        if cand in entries and bool(entries[cand].get('adult')) != adult:
+            return cand
+    return None
+
+
 def bootstrap_proxy(settings):
     """在 Chromium 初始化之前把代理定下来（QTWEBENGINE_CHROMIUM_FLAGS 只在导入前有效）。"""
     flags = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
@@ -339,6 +368,10 @@ class WebWindow(QMainWindow):
             state_line = '未安装'
             buttons = [{'t': '全新安装', 'a': 'game-update', 'pri': True}]
             note = '「全新安装」直接从 DMM CDN 下载到本客户端目录，不需要官方 Player。'
+        other = variant_other(product)
+        if other:
+            other_adult = bool(next((item for item in catalog() if item['product'] == other), {}).get('adult'))
+            buttons.append({'t': '前往 R18 版' if other_adult else '前往普通版', 'a': 'open-variant'})
         self.send(type='detail', product=product, open=open_view,
                   title=self.known_titles().get(product, product), cover=cover_uri(product),
                   coverBase=cover_base(product),
@@ -499,6 +532,10 @@ class WebWindow(QMainWindow):
         if action == 'refresh': self.version_checked_at = 0.0; self.kick_version_check(); self.push_snapshot(); self.report('已刷新'); return
         if action == 'refresh-catalog': self.run_action('refresh-catalog'); return
         if action == 'open-detail': self.open_detail(payload.get('product', '')); return
+        if action == 'open-variant':
+            other = variant_other(product)
+            if other: self.open_detail(other)
+            return
         if action == 'select-game': self.select_game(payload.get('product', '')); return
         if action == 'detail-open': self.open_detail(product); return
         if action == '__close_detail' or action == 'close-detail': self.close_detail(); return
