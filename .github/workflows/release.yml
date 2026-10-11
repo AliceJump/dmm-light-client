@@ -11,6 +11,10 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      # Windows runner 默认 stdout 是 cp1252，脚本里的中文输出会 UnicodeEncodeError
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
     steps:
       - uses: actions/checkout@v4
 

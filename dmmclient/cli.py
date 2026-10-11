@@ -27,6 +27,19 @@ from .backend.settings import (game_install_root, load_settings, remember_instal
 from .backend.xray import NodeStore, operation_proxy
 
 
+def _force_utf8() -> None:
+    """把标准输出与错误流切成 UTF-8。
+
+    Windows 控制台与 CI 的默认编码可能是 cp1252 之类的窄编码，打印中文会直接抛
+    UnicodeEncodeError；errors='replace' 保证即使切换失败也不会崩。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def say(text=''):
     print(text, flush=True)
 
@@ -296,6 +309,7 @@ def build_parser():
 
 
 def main(argv=None):
+    _force_utf8()
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

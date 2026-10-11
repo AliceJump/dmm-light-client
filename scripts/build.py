@@ -16,6 +16,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 APP_NAME = 'DmmLightClient'
 
+# Windows 控制台 / CI 可能是 cp1252 之类的窄编码，中文输出会 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 def version() -> str:
     text = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
