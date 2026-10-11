@@ -378,10 +378,7 @@ function renderPane(d) {
   if (paneProduct !== d.product) {
     paneProduct = d.product;                       // 切游戏：整栏重建（带入场动画）
     const blocks = paneBlocks(d);
-    if (sigs['pane:' + d.product] !== 'full') {
-      sigs['pane:' + d.product] = 'full';
-      pane.outerHTML = `<div class="pane" id="gamedetail">${PANE_ORDER.map(k => blocks[k]).join('')}</div>`;
-    }
+    pane.outerHTML = `<div class="pane" id="gamedetail">${PANE_ORDER.map(k => blocks[k]).join('')}</div>`;
     // 整建后同步各块签名，否则下一次数据到达会把所有块当「变化」全部重建
     PANE_ORDER.forEach(key => { sigs[`pane:${d.product}:${key}`] = paneBlockSig(key, d); });
     return;
