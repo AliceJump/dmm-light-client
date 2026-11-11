@@ -134,7 +134,8 @@ class InstallationTests(unittest.TestCase):
         session.request.assert_not_called()
 
     def test_removed_directory_retains_the_true_path_error(self):
-        missing = self.base / 'removed'
+        # Windows temporary roots may be reported with their 8.3 alias.
+        missing = (self.base / 'removed').resolve()
         self.own(missing)
         state = gakumas_installation()
         self.assertFalse(state.installed)
