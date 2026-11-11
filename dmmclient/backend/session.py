@@ -387,10 +387,10 @@ class DmmSession:
 
     def _system_login(self, url):
         from dmmclient.backend.browser_proxy import temporary_browser_proxy
-        with temporary_browser_proxy(self.proxy, self.proxy_root, progress=self.progress):
-            self._wait_for_system_login(url)
+        with temporary_browser_proxy(self.proxy, self.proxy_root, progress=self.progress) as check_proxy:
+            self._wait_for_system_login(url, check_proxy)
 
-    def _wait_for_system_login(self, url):
+    def _wait_for_system_login(self, url, check_proxy=lambda: None):
         import ctypes
         import win32clipboard
         # The user requested the normal browser profile, including its saved passwords.
@@ -406,6 +406,7 @@ class DmmSession:
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
             self.cancel_check()
+            check_proxy()
             sequence = user32.GetClipboardSequenceNumber()
             if sequence == last_sequence:
                 time.sleep(0.25)

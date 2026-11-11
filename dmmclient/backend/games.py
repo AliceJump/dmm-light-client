@@ -14,7 +14,7 @@ from urllib.parse import urlencode, urljoin
 import psutil
 import requests
 
-from .helper import windows_args
+from .helper import launch_game, windows_args
 from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir, dmm_url
 from .settings import game_install_root, remember_install_base
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
@@ -723,12 +723,10 @@ class GameService:
         self.session.cancel_check()
         info=self.request_info(False)
         if self.plan(info,root).pending(): raise DmmError('服务器版本已改变，请重新启动以更新')
-        if info.get('is_administrator') and not ctypes.windll.shell32.IsUserAnAdmin():
-            raise DmmError('文件已准备完成；该游戏要求以管理员身份运行客户端后启动')
         exe=safe_path(root,info['exec_file_name'])
         if exe.suffix.lower()!='.exe' or not exe.is_file(): raise DmmError('游戏启动文件无效')
         args=windows_args(info.get('execute_args',''))
         if any(any(c in arg for c in '\0\n\r') for arg in args): raise DmmError('启动参数无效')
         self.stopped(root)
-        process=subprocess.Popen([str(exe),*args],cwd=root,shell=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        process=launch_game(exe,args,root,bool(info.get('is_administrator')),self.progress)
         return f'游戏进程已创建（PID {process.pid}），请确认游戏内登录成功'

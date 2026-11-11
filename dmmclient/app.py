@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import faulthandler
-import ctypes
 import json
 import math
 import os
@@ -10,7 +9,6 @@ import sys
 import threading
 import time
 import traceback
-import winreg
 from collections import deque
 from pathlib import Path
 
@@ -24,7 +22,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
     QMessageBox, QProgressBar, QPushButton, QScroller, QScrollerProperties, QScrollArea,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget)
 from .backend.accounts import AccountStore
-from .backend.browser_proxy import restore_browser_proxy
+from .backend.browser_proxy import (enable_system_proxy, restore_browser_proxy,
+    restore_system_proxy, system_proxy_active)
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path, game_root,
     installed_record, move_game, official_record, official_records, record_version, records,
     fetch_shot, fetch_detail_shots, refresh_catalog, save_cover, store_detail, uninstall_game,
@@ -157,51 +156,6 @@ def log_error(text):
         with (data_dir() / 'client.log').open('a', encoding='utf-8', errors='replace') as stream:
             stream.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {text}\n')
     except OSError: pass
-
-
-_PROXY_KEY_PATH = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-_PROXY_BACKUP = {}
-_PROXY_LOCK = threading.Lock()
-
-
-def _read_system_proxy():
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PROXY_KEY_PATH, 0, winreg.KEY_READ) as key:
-            def get(name, default):
-                try: return winreg.QueryValueEx(key, name)[0]
-                except OSError: return default
-            return {'enable': get('ProxyEnable', 0), 'server': get('ProxyServer', '')}
-    except OSError:
-        return {'enable': 0, 'server': ''}
-
-
-def _apply_system_proxy(enable, server=''):
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PROXY_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 1 if enable else 0)
-        if enable and server:
-            winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, server)
-    wininet = ctypes.WinDLL('wininet')
-    wininet.InternetSetOptionW(None, 39, None, 0)   # INTERNET_OPTION_SETTINGS_CHANGED
-    wininet.InternetSetOptionW(None, 37, None, 0)   # INTERNET_OPTION_REFRESH
-
-
-def enable_system_proxy(server):
-    """临时开启 Windows 系统代理指向本客户端的常驻节点（备份原设置，可还原）。"""
-    with _PROXY_LOCK:
-        if 'enable' not in _PROXY_BACKUP:
-            _PROXY_BACKUP.update(_read_system_proxy())
-        _apply_system_proxy(True, server)
-
-
-def restore_system_proxy():
-    with _PROXY_LOCK:
-        if _PROXY_BACKUP:
-            _apply_system_proxy(bool(_PROXY_BACKUP.get('enable')), _PROXY_BACKUP.get('server', ''))
-            _PROXY_BACKUP.clear()
-
-
-def system_proxy_active():
-    return bool(_PROXY_BACKUP)
 
 
 class Worker(QThread):
@@ -1744,16 +1698,18 @@ class Window(QMainWindow):
             self.status.setText('正在暂停并保存下载断点…' + tail)
 
     def toggle_system_proxy(self, checked):
-        if checked:
-            try:
+        try:
+            if checked:
                 with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
-                    enable_system_proxy(str(proxy).replace('http://', ''))
+                    enable_system_proxy(str(proxy))
                 self.report('系统代理已开启：本机浏览器现在可访问 DMM 商店；关闭软件或再点一次即还原')
-            except DmmError as error:
-                self.sysproxy.setChecked(False)
-                self.report(f'系统代理开启失败：{error}')
-        else:
-            restore_system_proxy(); self.report('系统代理已恢复原设置')
+            else:
+                restore_system_proxy(progress=self.report)
+        except DmmError as error:
+            self.report(f'系统代理切换失败：{error}')
+        self.sysproxy.blockSignals(True)
+        self.sysproxy.setChecked(system_proxy_active())
+        self.sysproxy.blockSignals(False)
 
     def open_game_folder(self, product):
         """用资源管理器打开游戏安装目录（gakumas 走专用记录）。"""
@@ -1927,7 +1883,11 @@ class Window(QMainWindow):
         for worker in self.background_workers():
             if worker is None or not worker.isRunning(): continue
             worker.wait(max(200, int((deadline - time.monotonic()) * 1000)))
-        restore_system_proxy()
+        try:
+            restore_browser_proxy(data_dir(), progress=self.report)
+            restore_system_proxy(progress=self.report)
+        except DmmError as error:
+            self.report(str(error)); event.ignore(); return
         HUB.shutdown()
         event.accept()
 
@@ -1955,6 +1915,12 @@ def setup_logging():
 def main():
     log = setup_logging()
     try:
+        # Recover only snapshots left by a process that is no longer running.
+        try:
+            restore_browser_proxy(data_dir(), progress=print)
+            restore_system_proxy(progress=print)
+        except DmmError as error:
+            log_error(str(error))
         if '--native' in sys.argv:      # 原生 Qt 控件版保留为回退入口
             app = QApplication(sys.argv)
             window = Window(); window.show()
