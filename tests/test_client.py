@@ -27,7 +27,7 @@ class ClientTests(unittest.TestCase):
     def test_launch_updates_first(self):
         helper = Mock(spec=DmmHelper)
         events = []
-        helper.prepare.side_effect = lambda flag: (events.append(('prepare',flag)) or Mock(exe=Path('gakumas.exe'),arguments=[],version='1'))
+        helper.prepare.side_effect = lambda flag: (events.append(('prepare',flag)) or Mock(exe=Path('gakumas.exe'),arguments=[],version='1',requires_admin=False))
         helper.progress = lambda _: None
         with patch('dmmclient.backend.helper.ensure_game_stopped'), patch('dmmclient.backend.helper.subprocess.Popen',side_effect=lambda *a,**kw: (events.append(('process',None)) or Mock(pid=1))):
             DmmHelper.launch(helper, True)

@@ -761,15 +761,15 @@ class WebWindow(QMainWindow):
         except OSError: pass
 
     def toggle_system_proxy(self, on):
-        if on:
-            try:
+        try:
+            if on:
                 with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
-                    enable_system_proxy(str(proxy).replace('http://', ''))
+                    enable_system_proxy(str(proxy))
                 self.report('系统代理已开启：本机浏览器现在可访问 DMM 商店；关闭软件或再点一次即还原')
-            except DmmError as error:
-                self.report(f'系统代理开启失败：{error}')
-        else:
-            restore_system_proxy(); self.report('系统代理已恢复原设置')
+            else:
+                restore_system_proxy(progress=self.report)
+        except DmmError as error:
+            self.report(f'系统代理切换失败：{error}')
         self.push_snapshot()
 
     # ---------- 生命周期 ----------
@@ -788,7 +788,12 @@ class WebWindow(QMainWindow):
         for worker in self.background_workers():
             if worker is None or not worker.isRunning(): continue
             worker.wait(max(200, int((deadline - time.monotonic()) * 1000)))
-        restore_system_proxy()
+        try:
+            from .backend.browser_proxy import restore_browser_proxy
+            restore_browser_proxy(data_dir(), progress=self.report)
+            restore_system_proxy(progress=self.report)
+        except DmmError as error:
+            self.report(str(error)); event.ignore(); return
         HUB.shutdown()
         event.accept()
 

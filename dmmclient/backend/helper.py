@@ -6,6 +6,7 @@ import msvcrt
 import os
 import subprocess
 from contextlib import contextmanager
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +50,79 @@ def windows_args(arguments: str) -> list[str]:
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.LocalFree.argtypes = [ctypes.c_void_p]
         kernel.LocalFree(pointer)
+
+
+class _ShellExecuteInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG),
+                ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                ("hProcess", wintypes.HANDLE)]
+
+
+@dataclass(frozen=True)
+class ElevatedGame:
+    pid: int
+
+
+def _launch_elevated(exe: Path, arguments: list[str], cwd: Path):
+    """Ask Windows for UAC consent without elevating the client or its browser."""
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    shell.ShellExecuteExW.argtypes = [ctypes.POINTER(_ShellExecuteInfo)]
+    shell.ShellExecuteExW.restype = wintypes.BOOL
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessId.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    info = _ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    # Keep the process handle, wait for ShellExecute to finish even on worker
+    # threads without a message loop, and leave error reporting to this client.
+    info.fMask = 0x40 | 0x100 | 0x400
+    info.lpVerb = "runas"
+    info.lpFile = str(exe.resolve())
+    info.lpParameters = subprocess.list2cmdline(arguments)
+    info.lpDirectory = str(cwd.resolve())
+    info.nShow = 1
+    if not shell.ShellExecuteExW(ctypes.byref(info)):
+        code = ctypes.get_last_error()
+        if code == 1223:  # ERROR_CANCELLED: the user declined the UAC prompt.
+            raise DmmError("已取消管理员授权，游戏未启动") from None
+        raise DmmError(f"管理员权限启动失败（Windows 错误 {code}）") from None
+    if not info.hProcess:
+        raise DmmError("系统未返回游戏进程，无法确认启动成功")
+    try:
+        pid = kernel.GetProcessId(info.hProcess)
+        if not pid:
+            raise DmmError("无法读取已启动游戏的进程编号")
+        return ElevatedGame(pid)
+    finally:
+        kernel.CloseHandle(info.hProcess)
+
+
+def launch_game(exe: Path, arguments: list[str], cwd: Path, requires_admin=False,
+                progress=lambda message: None):
+    if requires_admin:
+        shell = ctypes.WinDLL("shell32", use_last_error=True)
+        shell.IsUserAnAdmin.argtypes = []
+        shell.IsUserAnAdmin.restype = wintypes.BOOL
+        if not shell.IsUserAnAdmin():
+            progress("游戏需要管理员权限，请在 Windows 授权窗口中确认")
+            return _launch_elevated(exe, arguments, cwd)
+    try:
+        return subprocess.Popen([str(exe), *arguments], cwd=cwd, shell=False,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        if getattr(error, "winerror", None) != 740:  # ERROR_ELEVATION_REQUIRED
+            raise DmmError("游戏进程启动失败，请检查文件占用和运行权限") from None
+    # An executable manifest can require elevation even when the launch API
+    # omits is_administrator. CreateProcess has not started a child in this case.
+    progress("游戏需要管理员权限，请在 Windows 授权窗口中确认")
+    return _launch_elevated(exe, arguments, cwd)
 
 
 def ensure_game_stopped():
@@ -112,6 +186,7 @@ class LaunchSpec:
     version: str
     plan: UpdatePlan = field(repr=False)
     sign: str = field(repr=False)
+    requires_admin: bool = False
 
 
 class DmmHelper:
@@ -158,8 +233,6 @@ class DmmHelper:
             raise DmmError("游戏启动响应格式不受支持")
         if data.get("drm_auth_token"):
             raise DmmError("此启动响应要求额外 DRM 流程，请暂用 DMM Player")
-        if data.get("is_administrator") and not ctypes.windll.shell32.IsUserAnAdmin():
-            raise DmmError("游戏要求管理员权限，请以管理员身份运行助手后重试")
         try:
             exe = safe_path(root, data["exec_file_name"])
             if exe.name.lower() != "gakumas.exe":
@@ -199,7 +272,7 @@ class DmmHelper:
         except (KeyError, TypeError, ValueError):
             raise DmmError("游戏启动或下载清单格式不受支持") from None
         self.progress(f"DMM 安装记录版本 {installed}；服务器版本 {version}")
-        return LaunchSpec(exe, arguments, version, plan, sign)
+        return LaunchSpec(exe, arguments, version, plan, sign, bool(data.get("is_administrator")))
 
     def updater(self, spec):
         return VerifiedUpdater(spec.plan, self.session.proxy, spec.sign, self.progress, ensure_update_idle,
@@ -250,10 +323,7 @@ class DmmHelper:
     def launch(self, auto_update=True):
         spec = self.prepare(auto_update)
         ensure_game_stopped()
-        try:
-            process = subprocess.Popen([str(spec.exe), *spec.arguments], cwd=spec.exe.parent, shell=False,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            raise DmmError("游戏进程启动失败，请检查文件占用和运行权限") from None
+        process = launch_game(spec.exe, spec.arguments, spec.exe.parent,
+                              spec.requires_admin, self.progress)
         self.progress(f"游戏进程已创建，PID={process.pid}；窗口出现后仍需确认游戏登录成功")
         return process

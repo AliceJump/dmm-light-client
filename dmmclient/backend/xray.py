@@ -252,45 +252,84 @@ class NodeStore:
                 progress('独立 Xray 内核已复制；后续运行不依赖 v2rayN')
                 return self.exe
         progress('下载官方 Xray Windows 内核')
+        # The core cannot provide its own bootstrap connection before installation.
+        # Keep this explicit proxy independent of Windows' temporary browser proxy.
+        proxy = valid_proxy(bootstrap_proxy)
+        stage = '获取版本信息'
+        hint = '；可将可信内核放到客户端数据目录的 xray-core/xray.exe'
         try:
-            http = requests.Session()
-            http.trust_env = False
-            http.proxies = {'http': valid_proxy(bootstrap_proxy), 'https': valid_proxy(bootstrap_proxy)}
-            response = http.get('https://api.github.com/repos/XTLS/Xray-core/releases/latest', timeout=(10, 30))
-            response.raise_for_status()
-            release = response.json()
-            archive = next(a for a in release['assets'] if a['name'] == 'Xray-windows-64.zip')
-            url = archive['browser_download_url']
-            if not url.startswith('https://github.com/XTLS/Xray-core/releases/download/'):
-                raise ValueError()
-            response = http.get(url, timeout=(10, 60))
-            response.raise_for_status()
-            data = response.content
-            if len(data) > 128 * 1024 * 1024:
-                raise ValueError()
-            digest = archive.get('digest') or ''
-            if digest.startswith('sha256:'):
-                expected = digest[7:]
-            else:
-                dgst = next(a for a in release['assets'] if a['name'] == archive['name'] + '.dgst')
-                digest_url = dgst['browser_download_url']
-                if not digest_url.startswith('https://github.com/XTLS/Xray-core/releases/download/'):
-                    raise ValueError()
-                response = http.get(digest_url, timeout=(10, 30))
+            with requests.Session() as http:
+                http.trust_env = False
+                http.proxies = {'http': proxy, 'https': proxy}
+                response = http.get('https://api.github.com/repos/XTLS/Xray-core/releases/latest', timeout=(10, 30))
                 response.raise_for_status()
-                expected = re.search(r'(?im)^SHA256\s*=\s*([a-f0-9]{64})\s*$', response.text)[1]
-            if not re.fullmatch(r'[a-fA-F0-9]{64}', expected) or hashlib.sha256(data).hexdigest() != expected.lower():
-                raise ValueError()
+                try:
+                    release = response.json()
+                except ValueError:
+                    raise DmmError('GitHub 返回的版本信息不是有效 JSON') from None
+                archive = next((a for a in release['assets'] if a['name'] == 'Xray-windows-64.zip'), None)
+                if archive is None:
+                    raise DmmError('官方版本未提供 Windows x64 内核压缩包')
+                url = archive['browser_download_url']
+                if not url.startswith('https://github.com/XTLS/Xray-core/releases/download/'):
+                    raise DmmError('内核下载地址不是官方发布地址')
+                stage = '下载内核压缩包'
+                response = http.get(url, timeout=(10, 60))
+                response.raise_for_status()
+                data = response.content
+                if len(data) > 128 * 1024 * 1024:
+                    raise DmmError('内核压缩包超过 128 MiB 限制')
+                stage = '读取 SHA-256 校验信息'
+                digest = archive.get('digest') or ''
+                if digest.startswith('sha256:'):
+                    expected = digest[7:]
+                else:
+                    dgst = next((a for a in release['assets'] if a['name'] == archive['name'] + '.dgst'), None)
+                    if dgst is None:
+                        raise DmmError('官方版本未提供 SHA-256 校验信息')
+                    digest_url = dgst['browser_download_url']
+                    if not digest_url.startswith('https://github.com/XTLS/Xray-core/releases/download/'):
+                        raise DmmError('校验文件地址不是官方发布地址')
+                    response = http.get(digest_url, timeout=(10, 30))
+                    response.raise_for_status()
+                    # Xray's release workflow strips OpenSSL's filename, leaving
+                    # SHA256= on older OpenSSL or SHA2-256= on OpenSSL 3.
+                    hashes = re.findall(r'(?im)^SHA(?:2-)?256[ \t]*=[ \t]*([a-f0-9]{64})[ \t\r]*$', response.text)
+                    if len(hashes) != 1:
+                        raise DmmError('官方校验文件中没有唯一有效的 SHA-256')
+                    expected = hashes[0]
+            stage = '校验内核压缩包'
+            if not re.fullmatch(r'[a-fA-F0-9]{64}', expected):
+                raise DmmError('SHA-256 校验信息格式无效，已拒绝安装')
+            if hashlib.sha256(data).hexdigest() != expected.lower():
+                raise DmmError('SHA-256 不匹配，已拒绝安装')
+            stage = '解压内核'
             with zipfile.ZipFile(io.BytesIO(data)) as zip_file:
-                item = next(i for i in zip_file.infolist() if i.filename.lower() == 'xray.exe')
+                item = next((i for i in zip_file.infolist() if i.filename.lower() == 'xray.exe'), None)
+                if item is None:
+                    raise DmmError('压缩包中缺少 xray.exe')
                 if item.file_size > 128 * 1024 * 1024:
-                    raise ValueError()
+                    raise DmmError('内核超过 128 MiB 限制')
                 executable = zip_file.read(item)
             if not executable.startswith(b'MZ'):
-                raise ValueError()
+                raise DmmError('内核不是有效 Windows 程序')
+            stage = '保存内核'
             atomic_write(self.exe, executable)
+        except requests.exceptions.ProxyError:
+            raise DmmError(f'官方 Xray {stage}失败：代理连接失败，请确认外部代理已启动且地址、端口和协议正确{hint}') from None
+        except requests.exceptions.Timeout:
+            raise DmmError(f'官方 Xray {stage}失败：连接超时，请检查外部代理和 GitHub 连通性{hint}') from None
+        except requests.exceptions.HTTPError as error:
+            status = error.response.status_code if error.response is not None else '未知'
+            raise DmmError(f'官方 Xray {stage}失败：HTTP {status}，请检查 GitHub 访问或限流情况{hint}') from None
+        except requests.RequestException:
+            raise DmmError(f'官方 Xray {stage}失败：网络请求失败，请检查外部代理和 GitHub 连通性{hint}') from None
+        except DmmError as error:
+            raise DmmError(f'官方 Xray {stage}失败：{error}{hint}') from None
+        except OSError:
+            raise DmmError(f'官方 Xray {stage}失败：文件读写失败，请检查数据目录权限和磁盘空间{hint}') from None
         except Exception:
-            raise DmmError('官方 Xray 下载或 SHA-256 校验失败；可将可信内核放到 xray-core/xray.exe') from None
+            raise DmmError(f'官方 Xray {stage}失败：发布信息或压缩包格式无效{hint}') from None
         return self.exe
 
     def import_node(self, text, bootstrap_proxy, progress=lambda message: None):
