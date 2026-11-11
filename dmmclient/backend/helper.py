@@ -12,7 +12,8 @@ from pathlib import Path
 
 import psutil
 
-from dmmclient.backend.session import DmmError, DmmSession, atomic_write, dmm_dir, dmm_url
+from dmmclient.backend.installation import gakumas_installation
+from dmmclient.backend.session import DmmError, DmmSession, atomic_write, dmm_url
 from dmmclient.backend.updater import UpdatePlan, VerifiedUpdater, safe_path
 
 
@@ -196,34 +197,28 @@ class DmmHelper:
         self.session.progress = progress
         self.download_progress = download_progress
 
+    @classmethod
+    def from_session(cls, session, progress=lambda message: None,
+                     download_progress=lambda done, total: None):
+        """复用调用方的账号、代理和取消状态，不另建一份登录会话。"""
+        helper = cls.__new__(cls)
+        helper.session = session
+        helper.progress = progress
+        helper.download_progress = download_progress
+        return helper
+
     @staticmethod
     def installed_game():
-        from dmmclient.backend.session import data_dir
-        own = data_dir() / 'installation.json'
-        if own.exists():
-            try:
-                record = json.loads(own.read_text(encoding='utf-8'))
-                root = Path(record['root']).resolve()
-                if not root.is_dir(): raise ValueError()
-                return root, record.get('version', '未知')
-            except Exception:
-                raise DmmError('游戏安装目录无效，请重新选择目录') from None
-        try:
-            config = json.loads((dmm_dir() / "dmmgame.cnf").read_text(encoding="utf-8"))
-            game = next(item for item in config["contents"] if item["productId"] == "gakumas")
-            if not game["detail"]["installed"] or game["gameType"] != "GCL":
-                raise ValueError()
-            root = Path(game["detail"]["path"]).resolve()
-            if not root.is_dir():
-                raise ValueError()
-            return root, game["detail"]["version"]
-        except Exception:
-            raise DmmError("DMM 安装配置中未找到已安装的学园偶像大师") from None
+        state = gakumas_installation()
+        # 提交中断时主程序可能已进备份目录，仍须让原有 updater.recover() 接手。
+        if state.installed or state.recoverable:
+            return state.root, state.version
+        raise DmmError(state.error)
 
     def fetch(self):
+        root, installed = self.installed_game()
         self.progress("检查并续期 DMM 登录态")
         self.session.ensure_login()
-        root, installed = self.installed_game()
         self.progress("请求最新版本与启动参数")
         data = self.session.request("/v5/r2/launch/cl", {
             "product_id": "gakumas", "game_type": "GCL", "game_os": "win",

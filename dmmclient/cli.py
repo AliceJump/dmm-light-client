@@ -20,8 +20,10 @@ from pathlib import Path
 
 from .backend.accounts import AccountStore
 from .backend.games import (GameService, catalog, checked_product, game_root, move_game,
-                            official_records, records, refresh_catalog, uninstall_game)
-from .backend.session import (DmmError, DmmSession, LoginRequired, data_dir, valid_proxy)
+                            installed_records, official_records, records, refresh_catalog, uninstall_game)
+from .backend.helper import DmmHelper, helper_lock
+from .backend.installation import GAKUMAS_INSTALL_HINT, gakumas_installation
+from .backend.session import (DmmError, DmmSession, LoginRequired, atomic_write, data_dir, valid_proxy)
 from .backend.settings import (game_install_root, load_settings, remember_install_base,
                                save_settings)
 from .backend.xray import NodeStore, operation_proxy
@@ -78,7 +80,7 @@ def game_service(session, product, meter=None):
 # ---------- 命令 ----------
 
 def cmd_list(args):
-    installed = {**official_records(), **records()}
+    installed = installed_records()
     if not installed:
         say('（没有已安装的游戏）')
         return 0
@@ -86,7 +88,7 @@ def cmd_list(args):
         say(json.dumps(installed, ensure_ascii=False, indent=2))
         return 0
     for product, value in sorted(installed.items()):
-        origin = '本客户端' if product in records() else '官方 Player'
+        origin = '已绑定' if product == 'gakumas' else '本客户端' if product in records() else '官方 Player'
         say(f"{product:24s} {str(value.get('version', '?')):12s} [{origin}] {value.get('root', '')}")
     return 0
 
@@ -117,12 +119,20 @@ def cmd_refresh(args):
 
 
 def cmd_check(args):
+    if args.product == 'gakumas': DmmHelper.installed_game()
     with open_session(load_settings()) as session:
         say(game_service(session, args.product).execute('check'))
     return 0
 
 
 def cmd_install(args):
+    if args.product == 'gakumas':
+        installation = gakumas_installation()
+        if not installation.installed and not installation.recoverable:
+            raise DmmError(GAKUMAS_INSTALL_HINT)
+        if args.dir:
+            raise DmmError('学园已有游戏目录请使用 dmmcli dir gakumas --set <游戏目录> 绑定')
+        return cmd_update(args)
     if args.dir:
         remember_install_base(args.product, Path(args.dir))
     root = game_install_root(args.product)
@@ -136,6 +146,7 @@ def cmd_install(args):
 
 
 def cmd_update(args):
+    if args.product == 'gakumas': DmmHelper.installed_game()
     meter = Meter()
     with open_session(load_settings()) as session:
         result = game_service(session, args.product, meter).execute('update')
@@ -145,6 +156,7 @@ def cmd_update(args):
 
 
 def cmd_launch(args):
+    if args.product == 'gakumas': DmmHelper.installed_game()
     with open_session(load_settings()) as session:
         say(game_service(session, args.product).execute('launch'))
     return 0
@@ -185,11 +197,26 @@ def cmd_uninstall(args):
 def cmd_dir(args):
     checked_product(args.product)
     if args.set:
+        if args.product == 'gakumas':
+            root = Path(args.set).expanduser().resolve()
+            if not (root / 'gakumas.exe').is_file():
+                raise DmmError('所选目录中没有 gakumas.exe')
+            current = gakumas_installation()
+            version = current.version if current.installed and current.root == root else '未知'
+            with helper_lock(data_dir()):
+                atomic_write(data_dir() / 'installation.json',
+                             json.dumps({'root': str(root), 'version': version}).encode())
+            say(f'学园游戏目录已绑定为 {root}')
+            return 0
         base = remember_install_base(args.product, Path(args.set))
         say(f'安装位置已设为 {base / args.product}')
         return 0
     current = game_root(args.product)
     say(f'当前目录：{current if current else "（未安装）"}')
+    if args.product == 'gakumas':
+        if current is None: say(gakumas_installation().error)
+        say('重新绑定：dmmcli dir gakumas --set <含 gakumas.exe 的目录>')
+        return 0
     say(f'安装位置：{game_install_root(args.product)}')
     return 0
 
