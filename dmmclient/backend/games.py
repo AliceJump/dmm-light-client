@@ -1,12 +1,13 @@
 """Explicitly supported downloadable games, with independent install records."""
 from __future__ import annotations
 
-import ctypes
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from html import unescape
 from pathlib import Path
 from urllib.parse import urlencode, urljoin
@@ -14,11 +15,12 @@ from urllib.parse import urlencode, urljoin
 import psutil
 import requests
 
-from .helper import DmmHelper, launch_game, windows_args
+from .helper import DmmHelper, launch_game, run_installer, windows_args
 from .installation import GAKUMAS_INSTALL_HINT, GAKUMAS_TITLE, gakumas_installation
 from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir, dmm_url
 from .settings import game_install_root, remember_install_base
-from .updater import UpdatePlan, VerifiedUpdater, safe_path
+from .updater import (UpdatePlan, VerifiedUpdater, is_link_or_junction,
+                      reject_link_parents, safe_path)
 
 # JSON 文件缓存：key -> (mtime_ns, 解析结果)。mtime 没变就直接复用，
 # 避免 GUI 线程每次快照都重复读盘解析（catalog/games.json/dmmgame.cnf）。
@@ -300,6 +302,34 @@ def _safe_to_remove(root):
     return True
 
 
+def _game_tree(root):
+    """Inventory without following links; destructive callers must inspect first."""
+    reject_link_parents(root)
+    files, directories = [], []
+
+    def walk_error(error):
+        raise DmmError('游戏目录无法完整读取，已停止文件操作') from error
+
+    for directory, names, filenames in os.walk(root, followlinks=False, onerror=walk_error):
+        base = Path(directory)
+        for name in names:
+            child = base / name
+            if is_link_or_junction(child):
+                raise DmmError('游戏目录含符号链接或目录联接，已停止文件操作')
+            directories.append(child)
+        for name in filenames:
+            child = base / name
+            if is_link_or_junction(child) or not child.is_file():
+                raise DmmError('游戏目录含链接或非普通文件，已停止文件操作')
+            files.append(child)
+    return files, directories
+
+
+def _file_digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').digest()
+
+
 def _plain(value):
     return re.sub(r'<br\s*/?>', '\n', str(value or '')).strip()
 
@@ -336,6 +366,7 @@ def store_detail(session, product, adult=False):
 
     不用抓网页。结果按商品缓存在 details/ 下；R18 要带年龄认证 cookie。
     """
+    checked_product(product)
     cache = data_dir() / 'details' / f'{product}.json'
     if cache.is_file():
         try:
@@ -383,6 +414,7 @@ def fetch_shot(http, url, target):
 
 def fetch_detail_shots(http, product, images, limit=8):
     """下载详情截图：缩略图与大图分开缓存（列表用缩略图，灯箱放大用大图）。"""
+    checked_product(product)
     folder = data_dir() / 'shots'
     out = []
     for index, image in enumerate(images[:limit]):
@@ -401,6 +433,7 @@ def fetch_detail_shots(http, product, images, limit=8):
 
 def load_shot_pairs(product):
     """把 shots 缓存目录里的截图重组为 [{'t': 缩略图, 'f': 大图}]（按编号排序）。"""
+    checked_product(product)
     folder = data_dir() / 'shots'
     pairs = {}
     for path in folder.glob(f'{product}-*.jpg'):
@@ -420,11 +453,15 @@ def uninstall_game(product, keep_files=False, progress=lambda done, total: None,
     只删记录里那一个目录，先删文件再删空目录；每一步都检查取消。
     返回 {'files': 删除的文件数, 'bytes': 释放的字节数}。
     """
+    checked_product(product)
     value = records()
     record = value.get(product)
     if not record or not record.get('root'):
         raise DmmError('该游戏不是由本客户端安装的，无法卸载')
-    root = Path(record['root']).resolve()
+    configured_root = Path(record['root'])
+    if not keep_files:
+        reject_link_parents(configured_root)
+    root = configured_root.resolve()
     if game_running(root):
         raise DmmError('该游戏正在运行，请先关闭游戏再卸载')
     removed = freed = 0
@@ -433,7 +470,7 @@ def uninstall_game(product, keep_files=False, progress=lambda done, total: None,
             raise DmmError(f'原游戏目录已不存在：{root}；可选择「只移除记录，保留文件」')
         if not _safe_to_remove(root):
             raise DmmError(f'安装目录不安全，已拒绝删除：{root}')
-        targets = [path for path in root.rglob('*') if path.is_file()]
+        targets, directories = _game_tree(root)
         total = sum(path.stat().st_size for path in targets)
         message(f'删除 {len(targets)} 个文件 · {total / 1048576:.1f} MiB')
         done = 0
@@ -443,16 +480,16 @@ def uninstall_game(product, keep_files=False, progress=lambda done, total: None,
                 size = path.stat().st_size
                 path.unlink(); removed += 1; freed += size
             except OSError:
-                continue
+                raise DmmError('部分游戏文件无法删除，安装记录已保留；请关闭占用程序后重试') from None
             done += size
             progress(done, total or 1)
         cancel_check()
-        for folder in sorted((p for p in root.rglob('*') if p.is_dir()),
-                             key=lambda p: len(p.parts), reverse=True):
-            try: folder.rmdir()
-            except OSError: pass
-        try: root.rmdir()
-        except OSError: pass
+        try:
+            for folder in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+                folder.rmdir()
+            root.rmdir()
+        except OSError:
+            raise DmmError('游戏目录尚未删除完成，安装记录已保留；请检查新增文件或文件占用后重试') from None
     value.pop(product, None)
     atomic_write(data_dir() / 'games.json', json.dumps(value, ensure_ascii=False).encode())
     return {'files': removed, 'bytes': freed}
@@ -464,36 +501,78 @@ def move_game(product, base, progress=lambda done, total: None,
 
     先完整复制、最后才删源目录：中途失败或取消时源目录依然完整。
     """
+    checked_product(product)
     record = records().get(product)
     if not record or not record.get('root'):
         raise DmmError('该游戏不是由本客户端安装的，无法移动目录')
-    source = Path(record['root']).resolve()
+    configured_source = Path(record['root'])
+    configured_target = Path(base).expanduser() / product
+    reject_link_parents(configured_source)
+    reject_link_parents(configured_target)
+    source = configured_source.resolve()
     if not source.is_dir():
         raise DmmError(f'原游戏目录已失效：{source}；请先确认游戏文件的位置')
-    target = Path(base).expanduser().resolve() / product
+    target = configured_target.resolve()
     if source == target:
         message('游戏已经在该目录下')
         return target
+    if source.is_relative_to(target) or target.is_relative_to(source):
+        raise DmmError('源目录和目标目录不能互相包含，请选择游戏目录之外的位置')
+    if not _safe_to_remove(source):
+        raise DmmError('原安装目录不安全，已停止移动')
+    if target.exists() and not target.is_dir():
+        raise DmmError('目标路径不是目录，请换一个位置')
     if target.exists() and any(target.iterdir()):
         raise DmmError('目标目录不为空，请换一个位置')
     if game_running(source):
         raise DmmError('该游戏正在运行，请先关闭游戏再移动目录')
-    files = [path for path in source.rglob('*') if path.is_file()]
+    files, directories = _game_tree(source)
+    snapshot = {path.relative_to(source): (path.stat().st_size, path.stat().st_mtime_ns)
+                for path in files}
     total = sum(path.stat().st_size for path in files)
     message(f'移动 {len(files)} 个文件 · {total / 1048576:.1f} MiB 到 {target}')
-    done = 0
-    for path in files:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # A cancelled copy never occupies the final destination, so it can be retried.
+    with tempfile.TemporaryDirectory(prefix=f'.{product}-moving-', dir=target.parent,
+                                     ignore_cleanup_errors=True) as temporary:
+        staging = Path(temporary)
+        done = 0
+        for directory in directories:
+            (staging / directory.relative_to(source)).mkdir(parents=True, exist_ok=True)
+        for path in files:
+            cancel_check()
+            destination = staging / path.relative_to(source)
+            reject_link_parents(destination, staging)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+            if _file_digest(path) != _file_digest(destination):
+                raise DmmError('复制后的文件校验失败，原目录和安装记录已保留')
+            done += path.stat().st_size
+            progress(done, total)
         cancel_check()
-        destination = target / path.relative_to(source)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination)
-        done += path.stat().st_size
-        progress(done, total)
-    cancel_check()
-    shutil.rmtree(source)
-    value = records()
-    value[product] = {**value[product], 'root': str(target)}
-    atomic_write(data_dir() / 'games.json', json.dumps(value, ensure_ascii=False).encode())
+        after_files, after_directories = _game_tree(source)
+        after = {path.relative_to(source): (path.stat().st_size, path.stat().st_mtime_ns)
+                 for path in after_files}
+        if after != snapshot or {p.relative_to(source) for p in after_directories} != {p.relative_to(source) for p in directories}:
+            raise DmmError('复制期间原目录发生变化，原目录和安装记录已保留；请关闭相关程序后重试')
+        if game_running(source):
+            raise DmmError('复制期间游戏已启动，原目录和安装记录已保留；请关闭游戏后重试')
+        value = records()
+        if value.get(product) != record:
+            raise DmmError('复制期间安装记录发生变化，原目录已保留；请重新检查目录')
+        reject_link_parents(target)
+        if target.exists():
+            if not target.is_dir() or any(target.iterdir()):
+                raise DmmError('复制期间目标目录已被占用，原目录和安装记录已保留')
+            target.rmdir()
+        os.replace(staging, target)
+        value[product] = {**value[product], 'root': str(target)}
+        # Register the verified copy before removing the old tree.
+        atomic_write(data_dir() / 'games.json', json.dumps(value, ensure_ascii=False).encode())
+    try:
+        shutil.rmtree(source)
+    except OSError:
+        message('新目录已校验并登记；旧目录有文件被占用，已保留，请稍后自行清理')
     remember_install_base(product, base)
     return target
 
@@ -528,6 +607,8 @@ class GameService:
             data=self._request_info(endpoint,payload,installing)
         finally:
             if self.adult: set_age_cookie(self.session, False)
+        if not isinstance(data, dict):
+            raise DmmError('游戏安装信息格式不受支持')
         if data.get('product_id') != self.product: raise DmmError('服务器返回了其他游戏的安装信息')
         if data.get('has_installer'): raise DmmError('该游戏使用专用安装程序，暂不支持自动安装')
         if data.get('drm_auth_token'): raise DmmError('该游戏需要额外 DRM 授权，暂不支持启动')
@@ -536,7 +617,9 @@ class GameService:
             # 安装信息里没带上时，用 /v5/modules 单独取一次。
             extra=self.session.request('/v5/modules', {
                 'product_id':self.product,'game_type':payload['game_type'],'game_os':'win',**self.session.device})
-            data['modules']=extra.get('modules') or []
+            if not isinstance(extra, dict) or not isinstance(extra.get('modules'), list) or not extra['modules']:
+                raise DmmError('游戏要求运行库，但服务器未提供可用的运行库列表')
+            data['modules'] = extra['modules']
         if not data.get('file_list_url') or not data.get('sign'): raise DmmError('服务器未提供可用的标准下载清单')
         return data
 
@@ -599,18 +682,26 @@ class GameService:
         官方 Player 在下载流程里同样会下载这些模块并以管理员身份执行；同一版本的
         模块已经装过就跳过，避免每次更新都弹安装器。返回 {模块路径: 版本} 记录。
         """
-        modules=info.get('modules') or []
+        modules = info.get('modules')
+        if modules is None:
+            modules = []
+        if not isinstance(modules, list):
+            raise DmmError('运行库模块列表格式不受支持')
         done=dict(previous or {})
         for module in modules:
-            if not isinstance(module,dict): continue
+            if not isinstance(module,dict):
+                raise DmmError('运行库模块信息格式不受支持')
             domain=module.get('domain'); remote=module.get('module_file_url')
             folder=module.get('dir_name'); name=module.get('exec_file_name')
             version=str(module.get('module_version') or '')
-            if not all(isinstance(value,str) and value for value in (domain,remote,folder,name)): continue
+            if not all(isinstance(value,str) and value for value in (domain,remote,folder,name)):
+                raise DmmError('运行库模块信息不完整')
             if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,120}',folder) or not re.fullmatch(r'[A-Za-z0-9_.\-]{1,120}',name):
                 raise DmmError('运行库模块路径无效')
             key=f'{folder}/{name}'
-            target=root/folder/name
+            target = safe_path(Path(root), key)
+            if target.suffix.lower() != '.exe':
+                raise DmmError('运行库模块不是可执行文件，已停止安装')
             if done.get(key)==version and target.is_file(): continue
             url=dmm_url(urljoin(domain.rstrip('/')+'/',remote.lstrip('/')))
             self.progress(f'下载运行库 {name}（{folder}）')
@@ -620,6 +711,9 @@ class GameService:
         return done
 
     def _download_module(self, url, target, sign):
+        reject_link_parents(target)
+        temporary = target.with_name(target.name + '.part')
+        reject_link_parents(temporary)
         target.parent.mkdir(parents=True,exist_ok=True)
         headers={'Cookie':sign} if sign else {}
         attempts=getattr(self.session.http,'proxy_attempts',3)
@@ -630,12 +724,13 @@ class GameService:
                                            allow_redirects=False) as response:
                     if response.status_code!=200:
                         raise DmmError(f'运行库下载失败：HTTP {response.status_code}')
-                    temporary=target.with_name(target.name+'.part')
+                    reject_link_parents(temporary)
                     with temporary.open('wb') as output:
                         for block in response.iter_content(256*1024):
                             self.session.cancel_check()
                             if block: output.write(block)
                         output.flush(); os.fsync(output.fileno())
+                    reject_link_parents(target)
                     os.replace(temporary,target)
                     return
             except requests.RequestException:
@@ -649,11 +744,11 @@ class GameService:
         if target.suffix.lower()!='.exe' or not target.is_file():
             raise DmmError('运行库模块不是可执行文件，已跳过')
         self.progress(f'安装运行库 {target.name}（可能弹出 UAC，请允许）')
-        try:
-            subprocess.run([str(target)],cwd=str(target.parent),check=False)
-        except OSError:
-            # 安装包要求管理员权限时 CreateProcess 会失败，改由系统弹 UAC 启动。
-            ctypes.windll.shell32.ShellExecuteW(None,'runas',str(target),None,str(target.parent),1)
+        code = run_installer(target, [], target.parent, self.progress, self.session.cancel_check)
+        if code not in {0, 1641, 3010}:
+            raise DmmError(f'运行库安装未成功（退出码 {code}），已保留重试状态')
+        if code in {1641, 3010}:
+            self.progress('运行库安装成功，需要重新启动 Windows 后生效')
 
     def remote_info(self):
         """gameinfo 查询：最新版本与大小，未安装的游戏也可用（不触发 308 下载限制）。"""
@@ -684,19 +779,34 @@ class GameService:
         raise DmmError('无法识别该游戏类型（GCL/ACL 均不匹配）')
 
     def plan(self, info, root):
-        url=info['file_list_url']
-        manifest=self.session.request(url,method='GET')
-        entries=list(manifest['file_list'])
-        try: pages=self.session.request(url.rstrip('/')+'/totalpages',method='GET')['total_pages']
-        except DmmError as error:
-            if '404' not in str(error): raise
-            pages=1
-        if not isinstance(pages,int) or not 1<=pages<=10000: raise DmmError('下载清单分页无效')
-        for page in range(2,pages+1):
-            chunk=self.session.request(url+f'?page={page}',method='GET')
-            if chunk['domain'] != manifest['domain']: raise DmmError('下载清单服务器不一致')
-            entries.extend(chunk['file_list'])
-        return UpdatePlan.parse(root,manifest['domain'],entries,info['latest_version'])
+        try:
+            url = info['file_list_url']
+            if not isinstance(url, str):
+                raise ValueError()
+            manifest = self.session.request(url, method='GET')
+            if not isinstance(manifest, dict) or not isinstance(manifest.get('file_list'), list):
+                raise ValueError()
+            entries = list(manifest['file_list'])
+            try:
+                pagination = self.session.request(url.rstrip('/') + '/totalpages', method='GET')
+                pages = pagination['total_pages']
+            except DmmError as error:
+                if not re.search(r'(?:HTTP |result_code=)404(?:\D|$)', str(error)):
+                    raise
+                pages = 1
+            if not isinstance(pages, int) or isinstance(pages, bool) or not 1 <= pages <= 10000:
+                raise DmmError('下载清单分页无效')
+            for page in range(2, pages + 1):
+                self.session.cancel_check()
+                chunk = self.session.request(url + f'?page={page}', method='GET')
+                if not isinstance(chunk, dict) or not isinstance(chunk.get('file_list'), list):
+                    raise ValueError()
+                if chunk['domain'] != manifest['domain']:
+                    raise DmmError('下载清单服务器不一致')
+                entries.extend(chunk['file_list'])
+            return UpdatePlan.parse(root, manifest['domain'], entries, info['latest_version'])
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise DmmError('下载清单格式不受支持') from None
 
     def stopped(self, root):
         """只拦「要操作的这个游戏正在运行」；别的游戏在跑不互相阻碍。"""
@@ -711,6 +821,8 @@ class GameService:
             lambda:self.stopped(plan.root),self.session.cancel_check,self.download)
 
     def execute(self, action, install_root=None):
+        if action not in {'check', 'install', 'update', 'launch'}:
+            raise DmmError('未知操作')
         if self.product == 'gakumas':
             return self._execute_gakumas(action, install_root)
         saved=records().get(self.product) or official_record(self.product)

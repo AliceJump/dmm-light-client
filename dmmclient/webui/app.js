@@ -223,7 +223,7 @@ function renderNetwork(n) {
     <div class="panel wide"><h4>当前状态</h4><p class="muted">${esc(n.state)}</p></div>
     <div class="panel wide">
       <h4>游戏安装</h4>
-      <label class="flabel">默认游戏库（游戏会装到其下的 <product> 子目录）</label>
+      <label class="flabel">默认游戏库（游戏会装到其下的 &lt;product&gt; 子目录）</label>
       <div class="row" style="flex-wrap:nowrap;margin:4px 0 8px">
         <input class="field" id="defaultbase" style="margin:0;flex:1" value="${esc(n.installBase)}"
                placeholder="${esc(n.defaultBase)}">
@@ -247,14 +247,17 @@ let prevPage = 'lib';
 function listRows() {
   if (!state) return [];
   const installed = new Set(state.installedProducts || []);
-  return state.store.map(c => ({
+  const games = new Map([...(state.library || []), ...(state.store || [])]
+    .map(card => [card.product, card]));
+  return [...games.values()].map(c => ({
     product: c.product, title: c.title, cover: c.coverBase || c.cover || '',
-    meta: installed.has(c.product) ? '已安装' : '未安装'
+    meta: c.state || (installed.has(c.product) ? '已安装' : '未安装')
   })).filter(r =>
-    listFilter === 'all' || (listFilter === 'installed') === (r.meta === '已安装'));
+    listFilter === 'all' || (listFilter === 'installed') === installed.has(r.product));
 }
 
 function renderGameLib() {
+  patchGamelist($('gamelist'), listRows(), detail ? detail.product : '');
   if (!detail) {
     renderIfChanged('pane', 'empty', () => {
       paneProduct = '';
@@ -263,16 +266,15 @@ function renderGameLib() {
     return;
   }
   renderPane(detail);
-  patchGamelist($('gamelist'), listRows(), detail.product);
 }
 
 function applyDetail(data) {
   if (!data.product) return;
+  if (!data.open && (!detail || detail.product !== data.product)) return;
   detail = data;
   coverBase[data.product] = data.coverBase || coverBase[data.product];
-  if (!data.open) return;                    // 只是缓存数据，不开视图
-  renderGameLib();
-  if (currentPage !== 'gamelib') showPage('gamelib');
+  if (data.open && currentPage !== 'gamelib') showPage('gamelib');
+  else if (currentPage === 'gamelib') renderGameLib();
   if (!lightbox.classList.contains('hidden')) updateLightbox();   // 大图补抓完成后灯箱自动换成新图
 }
 

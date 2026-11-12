@@ -1,0 +1,115 @@
+{
+  "audit_date": "2026-11-12 Asia/Shanghai",
+  "source": "uv.lock registry packages, all platform markers included",
+  "lock_sha256": "b6ffae6179a3e5cfefc8d7974a091e26f70767872dcc03b2e5f937e4eb2b98d4",
+  "tool": "pip-audit 2.10.1",
+  "package_count": 21,
+  "finding_count": 0,
+  "packages": [
+    {
+      "name": "altgraph",
+      "version": "0.17.5",
+      "vulnerabilities": []
+    },
+    {
+      "name": "certifi",
+      "version": "2026.10.23",
+      "vulnerabilities": []
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.5.2",
+      "vulnerabilities": []
+    },
+    {
+      "name": "idna",
+      "version": "3.20",
+      "vulnerabilities": []
+    },
+    {
+      "name": "macholib",
+      "version": "1.16.4",
+      "vulnerabilities": []
+    },
+    {
+      "name": "packaging",
+      "version": "26.3",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pefile",
+      "version": "2024.8.26",
+      "vulnerabilities": []
+    },
+    {
+      "name": "psutil",
+      "version": "7.2.2",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pycryptodome",
+      "version": "3.23.0",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pyinstaller",
+      "version": "6.22.3",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pyinstaller-hooks-contrib",
+      "version": "2026.8",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pyside6",
+      "version": "6.11.2",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pyside6-addons",
+      "version": "6.11.2",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pyside6-essentials",
+      "version": "6.11.2",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pysocks",
+      "version": "1.7.1",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pywin32",
+      "version": "312",
+      "vulnerabilities": []
+    },
+    {
+      "name": "pywin32-ctypes",
+      "version": "0.2.3",
+      "vulnerabilities": []
+    },
+    {
+      "name": "requests",
+      "version": "2.34.2",
+      "vulnerabilities": []
+    },
+    {
+      "name": "setuptools",
+      "version": "84.2.1",
+      "vulnerabilities": []
+    },
+    {
+      "name": "shiboken6",
+      "version": "6.11.2",
+      "vulnerabilities": []
+    },
+    {
+      "name": "urllib3",
+      "version": "2.8.0",
+      "vulnerabilities": []
+    }
+  ]
+}

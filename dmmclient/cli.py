@@ -15,8 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+
+import requests
 
 from .backend.accounts import AccountStore
 from .backend.games import (GameService, catalog, checked_product, game_root, move_game,
@@ -25,7 +27,7 @@ from .backend.helper import DmmHelper, helper_lock
 from .backend.installation import GAKUMAS_INSTALL_HINT, gakumas_installation
 from .backend.session import (DmmError, DmmSession, LoginRequired, atomic_write, data_dir, valid_proxy)
 from .backend.settings import (game_install_root, load_settings, remember_install_base,
-                               save_settings)
+                               update_settings)
 from .backend.xray import NodeStore, operation_proxy
 
 
@@ -69,6 +71,7 @@ def open_session(settings, cancel=lambda: None):
     """起代理 + 登录，命令结束后自动收尾。"""
     with operation_proxy(settings, say, cancel, data_dir()) as proxy:
         session = DmmSession(proxy)
+        session.cancel_check = cancel
         session.ensure_login()
         yield session
 
@@ -81,11 +84,11 @@ def game_service(session, product, meter=None):
 
 def cmd_list(args):
     installed = installed_records()
-    if not installed:
-        say('（没有已安装的游戏）')
-        return 0
     if args.json:
         say(json.dumps(installed, ensure_ascii=False, indent=2))
+        return 0
+    if not installed:
+        say('（没有已安装的游戏）')
         return 0
     for product, value in sorted(installed.items()):
         origin = '已绑定' if product == 'gakumas' else '本客户端' if product in records() else '官方 Player'
@@ -203,9 +206,8 @@ def cmd_dir(args):
                 raise DmmError('所选目录中没有 gakumas.exe')
             current = gakumas_installation()
             version = current.version if current.installed and current.root == root else '未知'
-            with helper_lock(data_dir()):
-                atomic_write(data_dir() / 'installation.json',
-                             json.dumps({'root': str(root), 'version': version}).encode())
+            atomic_write(data_dir() / 'installation.json',
+                         json.dumps({'root': str(root), 'version': version}).encode())
             say(f'学园游戏目录已绑定为 {root}')
             return 0
         base = remember_install_base(args.product, Path(args.set))
@@ -255,8 +257,7 @@ def cmd_nodes(args):
 def cmd_proxy(args):
     settings = load_settings()
     if args.url:
-        settings['proxy'] = valid_proxy(args.url)
-        save_settings(settings)
+        settings = update_settings({'proxy': valid_proxy(args.url)})
         say(f"代理已设为 {settings['proxy']}")
         return 0
     say(settings['proxy'])
@@ -335,17 +336,37 @@ def build_parser():
     return parser
 
 
+def command_needs_lock(args):
+    if args.command in {'list', 'catalog', 'nodes'}:
+        return False
+    if args.command == 'accounts': return bool(args.switch)
+    if args.command == 'dir': return bool(args.set)
+    if args.command == 'proxy': return bool(args.url)
+    return True
+
+
 def main(argv=None):
     _force_utf8()
     args = build_parser().parse_args(argv)
     try:
-        return args.func(args)
+        if hasattr(args, 'product'):
+            checked_product(args.product)
+        # GUI workers, CLI writes and account switches share one process lock.
+        # Read-only commands remain usable while another operation is running.
+        with helper_lock(data_dir()) if command_needs_lock(args) else nullcontext():
+            return args.func(args)
     except LoginRequired as error:
         say(f'登录态不可用：{error}')
         say('请先在图形界面里登录一次（浏览器登录 / 导入官方登录态），再回到命令行。')
         return 2
     except DmmError as error:
         say(f'操作失败：{error}')
+        return 1
+    except (OSError, UnicodeError):
+        say('操作失败：本地文件无法读取或写入，请检查路径和权限')
+        return 1
+    except requests.RequestException:
+        say('操作失败：网络连接失败，请检查代理或切换节点')
         return 1
     except KeyboardInterrupt:
         say('已中断')

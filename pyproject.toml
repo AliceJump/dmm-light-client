@@ -3,7 +3,7 @@ name = "dmm-light-client"
 version = "1.0.1"
 description = "Independent Windows DMM client prototype"
 requires-python = ">=3.12"
-dependencies = ["PySide6>=6.8,<7", "requests[socks]>=2.32,<3", "psutil>=6", "pywin32>=306", "pycryptodome>=3.23,<4"]
+dependencies = ["PySide6>=6.8,<7", "requests[socks]>=2.32,<3", "certifi>=2026.10.19", "psutil>=6", "pywin32>=306", "pycryptodome>=3.23,<4"]
 [project.gui-scripts]
 dmm-light-client = "dmmclient.app:main"
 [project.scripts]
@@ -17,4 +17,5 @@ packages = ["dmmclient"]
 [dependency-groups]
 dev = [
     "pyinstaller>=6.22.3",
+    "setuptools>=84.1.0",
 ]
