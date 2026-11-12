@@ -25,10 +25,11 @@ from .backend.accounts import AccountStore
 from .backend.browser_proxy import (enable_system_proxy, restore_browser_proxy,
     restore_system_proxy, system_proxy_active)
 from .backend.games import (SUPPORTED, GameService, catalog, cover_path, game_root,
-    installed_record, move_game, official_record, official_records, record_version, records,
+    installed_record, installed_records, move_game, official_record, official_records, record_version, records,
     fetch_shot, fetch_detail_shots, refresh_catalog, save_cover, store_detail, uninstall_game,
     verify_version, load_shot_pairs)
 from .backend.helper import DmmHelper, helper_lock
+from .backend.installation import gakumas_installation
 from .backend.launcher import browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
     atomic_write, data_dir, dmm_url, valid_proxy)
@@ -37,6 +38,46 @@ from .backend.settings import (load_settings, remember_install_base, game_instal
 from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
 from .theme import (DUR_MID, DUR_SLOW, EASE_OUT, EASE_SPRING, build_style, easing,
     palette, system_theme)
+
+
+def normalize_game_action(action, product):
+    """Keep every Gakumas entry point on its dedicated installation workflow."""
+    if product == 'gakumas':
+        if action in {'game-launch', 'game-check', 'game-update'}:
+            return action.removeprefix('game-')
+        if action == 'game-dir':
+            return 'game-folder'
+    return action
+
+
+def gakumas_view(versions=None):
+    """One installation state and action list for both desktop frontends."""
+    installation = gakumas_installation()
+    buttons = []
+    if installation.installed:
+        state = f'已安装 · 版本 {installation.version}'
+        info = (versions or {}).get('gakumas') or {}
+        if info.get('pending'):
+            state += f" · 可更新到 {info['latest']}"
+        badge = {'t': '可更新' if info.get('pending') else '已安装',
+                 'k': 'up' if info.get('pending') else 'ok'}
+        buttons = [{'t': '启动', 'a': 'launch', 'pri': True},
+                   {'t': '检查更新', 'a': 'check'}, {'t': '更新', 'a': 'update'},
+                   {'t': '打开目录', 'a': 'open-dir'}]
+    else:
+        state = installation.error
+        badge = {'t': '目录失效' if installation.status == 'invalid' else '未安装', 'k': 'new'}
+        if installation.recoverable:
+            state = '更新中断，请恢复更新'
+            badge = {'t': '待恢复', 'k': 'up'}
+            buttons.append({'t': '恢复更新', 'a': 'update', 'pri': True})
+    if not installation.installed:
+        buttons.append({'t': '选择游戏目录', 'a': 'game-folder', 'pri': not buttons})
+    return {'installed': installation.installed, 'state': state,
+            'root': str(installation.root) if installation.root else '',
+            'badge': badge, 'buttons': buttons,
+            'note': '选择包含 gakumas.exe 的已有游戏目录后，可检查更新和启动。'
+                    '当前客户端不支持该游戏的专用程序首次安装。'}
 
 
 def rounded_pixmap(pixmap, radius=16):
@@ -166,7 +207,7 @@ class Worker(QThread):
 
     def __init__(self, action, settings, number='', name='', node_text='', product='', extra='', parent=None):
         super().__init__(parent)
-        self.action, self.settings = action, dict(settings)
+        self.action, self.settings = normalize_game_action(action, product), dict(settings)
         self.number, self.name, self.node_text = number, name, node_text
         self.product, self.extra = product, extra
         self.cancelled = threading.Event()
@@ -348,11 +389,20 @@ class VersionWorker(QThread):
                         result = verify_version(session, product, root)
                     except Exception:
                         continue
-                    if result['pending'] == 0 and result['version']:
+                    if product == 'gakumas':
+                        # Binding can change while the manifest request is in flight.
+                        # Serialize the final comparison/write with directory selection.
+                        with helper_lock(data_dir()):
+                            installation = gakumas_installation()
+                            if not installation.installed or installation.root != Path(root).resolve():
+                                continue
+                            if result['pending'] == 0 and result['version']:
+                                record_version(product, result['version'], root)
+                    elif result['pending'] == 0 and result['version']:
                         record_version(product, result['version'], root)
                     self.verified.emit(product, {'version': result['version'] or '',
                                                  'latest': result['latest'] or '',
-                                                 'pending': result['pending']})
+                                                 'pending': result['pending'], 'root': str(root)})
         except Exception:
             pass
 
@@ -1035,7 +1085,8 @@ class Window(QMainWindow):
     CARD_HEIGHT = 330
     COVER_SIZE = 150
 
-    def make_card(self, grid, buttons, covers, product, title, state, card_buttons, extra=()):
+    def make_card(self, grid, buttons, covers, product, title, state, card_buttons, extra=(),
+                  installed=False, badges=None):
         card = QWidget(); card.setObjectName('card')
         card.setFixedSize(self.CARD_WIDTH, self.CARD_HEIGHT)
         card.setProperty('product', product)
@@ -1044,7 +1095,7 @@ class Window(QMainWindow):
         box = QVBoxLayout(card); box.setContentsMargins(10, 10, 10, 11); box.setSpacing(8)
         cover = QLabel('暂无封面'); cover.setObjectName('cover'); cover.setAlignment(Qt.AlignCenter)
         cover.setFixedSize(self.COVER_SIZE, self.COVER_SIZE)
-        for text, kind, right in self.card_badges(state):
+        for text, kind, right in (badges if badges is not None else self.card_badges(state, installed)):
             tag = QLabel(text, cover); tag.setObjectName('badge'); tag.setProperty('kind', kind)
             tag.adjustSize()
             tag.move(cover.width() - tag.width() - 8 if right else 8, 8)
@@ -1082,9 +1133,9 @@ class Window(QMainWindow):
         grid.addItem(item); grid.setItemWidget(item, card)
 
     @staticmethod
-    def card_badges(state):
+    def card_badges(state, installed=False):
         """卡片状态角标：左上角状态，右上角 R18。"""
-        if '未安装' in state: badges = [('未安装', 'new', False)]
+        if not installed: badges = [('未安装', 'new', False)]
         elif '可更新' in state: badges = [('可更新', 'up', False)]
         else: badges = [('已安装', 'ok', False)]
         if 'R18' in state: badges.append(('R18', 'r18', True))
@@ -1134,22 +1185,13 @@ class Window(QMainWindow):
         offset = self.library_grid.verticalScrollBar().value() if keep_scroll else 0
         self.library_grid.setUpdatesEnabled(False)   # 重建期间别重绘，否则会先闪一下空白
         self.library_grid.clear(); self.library_buttons = []; self.library_covers = {}
-        installed = {**official_records(), **records()}
-        helper_root = None
-        try:
-            helper_root, version = DmmHelper.installed_game()
-            state = f'已安装 · 版本 {version}'
-        except DmmError:
-            state = '未识别官方安装记录'
-        if not helper_root:
-            try: helper_root = json.loads((data_dir() / 'installation.json').read_text(encoding='utf-8')).get('root')
-            except Exception: helper_root = None
-        gakumas_extra = [('打开目录', 'open-dir', False)] if helper_root and Path(helper_root).exists() \
-            else [('选择游戏目录', 'game-folder', False)]
+        installed = installed_records()
+        gakumas = gakumas_view(self.versions)
         self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
-            self.library_covers, 'gakumas', '学园偶像大师', state,
-            [('启动', 'launch', True), ('检查', 'check', False), ('更新', 'update', False)],
-            extra=gakumas_extra))
+            self.library_covers, 'gakumas', '学园偶像大师', gakumas['state'],
+            [(b['t'], b['a'], b.get('pri', False)) for b in gakumas['buttons']],
+            installed=gakumas['installed'],
+            badges=[(gakumas['badge']['t'], gakumas['badge']['k'], False)]))
         titles = self.known_titles()
         for product, value in sorted(installed.items()):
             if product == 'gakumas': continue  # 学园偶像大师固定为第一张卡片
@@ -1161,7 +1203,8 @@ class Window(QMainWindow):
             if managed: buttons += [('移动', 'game-dir', False), ('卸载', 'game-uninstall', False)]
             self.add_card(self.library_grid, self.make_card(self.library_grid, self.library_buttons,
                 self.library_covers, product, title,
-                f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}", buttons))
+                f"{origin}已安装 · 版本 {value.get('version', '未知')}{self.version_note(product)}", buttons,
+                installed=True))
         self._restore_scroll(self.library_grid, offset)
         self.library_grid.setUpdatesEnabled(True)
         self.fit_grids()
@@ -1170,7 +1213,7 @@ class Window(QMainWindow):
         offset = self.store_grid.verticalScrollBar().value() if keep_scroll else 0
         self.store_grid.setUpdatesEnabled(False)
         self.store_grid.clear(); self.store_buttons = []; self.store_covers = {}
-        installed = {**official_records(), **records()}
+        installed = installed_records()
         titles = self.known_titles()
         adult = {item['product'] for item in catalog() if item.get('adult')}
         query = self.search.text().strip().casefold()
@@ -1192,7 +1235,7 @@ class Window(QMainWindow):
                 state = badge + '未安装 · 可全新安装'
                 buttons = [('全新安装', 'game-update', True), ('安装位置', 'game-dir', False), ('详情', 'detail-open', False)]
             self.add_card(self.store_grid, self.make_card(self.store_grid, self.store_buttons,
-                self.store_covers, product, title, state, buttons))
+                self.store_covers, product, title, state, buttons, installed=bool(record)))
         self._restore_scroll(self.store_grid, offset)
         self.store_grid.setUpdatesEnabled(True)
         self.store_count.setText(f'{self.store_grid.count()} 款')
@@ -1241,12 +1284,12 @@ class Window(QMainWindow):
         self.kick_covers()
         self.kick_version_check()
         self.kick_account_check()
-        self.library_count.setText(f'{self.library_grid.count()} 款')
+        self.library_count.setText(f'{len(installed_records())} 款已安装')
         self.update_hero()
 
     def update_hero(self):
         """车库页顶部的「继续游戏」：优先上次启动的，否则第一款已安装游戏。"""
-        installed = {**official_records(), **records()}
+        installed = installed_records()
         product = self.settings.get('last_launched')
         if product not in installed:
             product = 'gakumas' if 'gakumas' in installed else (sorted(installed)[0] if installed else None)
@@ -1292,7 +1335,7 @@ class Window(QMainWindow):
         if not self.isVisible(): return
         if time.monotonic() - self.version_checked_at < 60: return
         targets = [(product, value['root']) for product, value in
-                   {**official_records(), **records()}.items() if value.get('root')]
+                   installed_records().items() if value.get('root')]
         if not targets: return
         self.version_checked_at = time.monotonic()
         self.version_worker = VersionWorker(self.settings, targets)
@@ -1316,6 +1359,10 @@ class Window(QMainWindow):
         self.refresh()
 
     def version_arrived(self, product, info):
+        if product == 'gakumas' and info.get('root'):
+            installation = gakumas_installation()
+            if not installation.installed or installation.root != Path(info['root']).resolve():
+                return
         self.versions[product] = info
         self.repopulate_library(True); self.repopulate_store(True); self.update_hero()
 
@@ -1351,7 +1398,8 @@ class Window(QMainWindow):
         return products
 
     def row_meta(self, product):
-        record = records().get(product) or official_records().get(product)
+        if product == 'gakumas': return gakumas_view(self.versions)['state']
+        record = installed_record(product)
         if not record: return '未安装'
         return f"已安装 · 版本 {self.installed_version(product, record.get('version', '未知'))}"
 
@@ -1491,7 +1539,8 @@ class Window(QMainWindow):
         self.detail.clear(); box = self.detail.box
         title = self.known_titles().get(product, product)
         entry = next((item for item in catalog() if item['product'] == product), {})
-        record = records().get(product) or official_records().get(product)
+        record = installed_record(product)
+        gakumas = gakumas_view(self.versions) if product == 'gakumas' else None
         version = self.installed_version(product, (record or {}).get('version', '未知')) if record else ''
 
         head = QHBoxLayout(); head.setSpacing(20)
@@ -1510,9 +1559,11 @@ class Window(QMainWindow):
             if text:
                 chip = QLabel(str(text)); chip.setObjectName('chip'); chips.addWidget(chip)
         chips.addStretch(); column.addLayout(chips)
-        column.addWidget(self.detail_line('状态', f'已安装 · 版本 {version}{self.version_note(product)}'
-                                          if record else '未安装'))
-        if record: column.addWidget(self.detail_line('目录', str(record.get('root', ''))))
+        state = (gakumas['state'] if gakumas else
+                 f'已安装 · 版本 {version}{self.version_note(product)}' if record else '未安装')
+        column.addWidget(self.detail_line('状态', state))
+        root = gakumas['root'] if gakumas else str(record.get('root', '')) if record else ''
+        if root: column.addWidget(self.detail_line('目录', root))
         column.addWidget(self.detail_line('编号', product))
         column.addStretch()
         head.addLayout(column, 1)
@@ -1526,6 +1577,8 @@ class Window(QMainWindow):
                 ([('启动', 'game-launch', True), ('检查更新', 'game-check', False), ('更新', 'game-update', False),
                   ('打开目录', 'open-dir', False)] if record else
                  [('全新安装', 'game-update', True)]))
+        if gakumas:
+            spec = [(b['t'], b['a'], b.get('pri', False)) for b in gakumas['buttons']]
         for text, action, accent in spec:
             button = QPushButton(text); button.setCursor(Qt.PointingHandCursor)
             if action == 'game-uninstall':
@@ -1587,7 +1640,8 @@ class Window(QMainWindow):
         if not data and self.detail_loading == product:
             loading = QLabel('正在获取商店信息（简介 / 截图 / 运行环境）…')
             loading.setObjectName('muted'); box.addWidget(loading)
-        note = QLabel('「全新安装」直接从 DMM CDN 下载到本客户端目录，不需要官方 Player。'
+        note = QLabel(gakumas['note'] if gakumas else
+                      '「全新安装」直接从 DMM CDN 下载到本客户端目录，不需要官方 Player。'
                       if not record else
                       '版本由后台清单校验自动纠正；游戏自己更新过也会显示正确版本。')
         note.setObjectName('muted'); note.setWordWrap(True); box.addWidget(note)
@@ -1729,6 +1783,7 @@ class Window(QMainWindow):
 
     def run_action(self, action, product=''):
         try:
+            action = normalize_game_action(action, product)
             # 打开详情与保存代理设置不与其他操作冲突，任何时候都立即执行
             if action == 'detail-open':
                 self.open_game_detail(product); return
@@ -1739,7 +1794,10 @@ class Window(QMainWindow):
                 if not (root / 'gakumas.exe').is_file(): raise DmmError('所选目录中没有 gakumas.exe')
                 with helper_lock(data_dir()):
                     atomic_write(data_dir() / 'installation.json', json.dumps({'root':str(root),'version':'未知'}).encode())
-                self.refresh(); self.report('游戏目录已保存'); return
+                self.versions.pop('gakumas', None)
+                self.refresh()
+                if self.detail_product == 'gakumas': self.fill_detail('gakumas')
+                self.report('游戏目录已保存'); return
             if action == 'open-dir':
                 self.open_game_folder(product); return
             if action == 'game-dir':
@@ -1870,6 +1928,7 @@ class Window(QMainWindow):
             return
         self.pause.setEnabled(False); self.bar.setRange(0,100); self.bar.hide()
         self.hide_busy(); self.node_text.clear(); self.refresh()
+        if self.detail_product: self.fill_detail(self.detail_product)
 
     def background_workers(self):
         return (self.cover_worker, self.version_worker, self.account_worker, self.detail_worker)

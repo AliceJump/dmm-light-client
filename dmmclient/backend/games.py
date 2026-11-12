@@ -14,7 +14,8 @@ from urllib.parse import urlencode, urljoin
 import psutil
 import requests
 
-from .helper import launch_game, windows_args
+from .helper import DmmHelper, launch_game, windows_args
+from .installation import GAKUMAS_INSTALL_HINT, GAKUMAS_TITLE, gakumas_installation
 from .session import DmmApiError, DmmError, atomic_write, data_dir, dmm_dir, dmm_url
 from .settings import game_install_root, remember_install_base
 from .updater import UpdatePlan, VerifiedUpdater, safe_path
@@ -127,8 +128,20 @@ def official_record(product):
 
 
 def installed_record(product):
-    """本客户端或官方 Player 安装过的游戏记录（gakumas 走专用流程，不在此列）。"""
+    """统一安装记录，学园必须同时验证专用记录和实际游戏文件。"""
+    if product == 'gakumas':
+        return gakumas_installation().as_record()
     return records().get(product) or official_record(product)
+
+
+def installed_records():
+    """界面与命令行共用的已安装列表；失效的学园记录不计为已安装。"""
+    installed = {**official_records(), **records()}
+    installed.pop('gakumas', None)
+    gakumas = gakumas_installation().as_record()
+    if gakumas:
+        installed['gakumas'] = gakumas
+    return installed
 
 
 def official_records():
@@ -217,7 +230,7 @@ def records():
 
 def game_root(product):
     """已安装游戏的当前目录（本客户端记录优先，其次官方 Player 记录）。"""
-    record = records().get(product) or official_record(product)
+    record = installed_record(product)
     root = (record or {}).get('root')
     return Path(root).resolve() if root else None
 
@@ -237,20 +250,17 @@ def game_running(root):
 
 def record_version(product, version, root=None):
     """把核对出来的真实版本写回安装记录（游戏自己更新过时记录会过期）。"""
+    if product == 'gakumas':
+        root = root or gakumas_installation().root
+        if root:
+            atomic_write(data_dir() / 'installation.json',
+                         json.dumps({'root': str(root), 'version': str(version)}).encode())
+        return
     value = records()
     if product in value:
         value[product] = {**value[product], 'version': str(version)}
         atomic_write(data_dir() / 'games.json', json.dumps(value, ensure_ascii=False).encode())
         return
-    if product == 'gakumas':
-        path = data_dir() / 'installation.json'
-        try:
-            current = json.loads(path.read_text(encoding='utf-8'))
-            root = root or current.get('root')
-        except Exception:
-            pass
-        if root:
-            atomic_write(path, json.dumps({'root': str(root), 'version': str(version)}).encode())
 
 
 def verify_version(session, product, root, progress=lambda message: None):
@@ -259,6 +269,13 @@ def verify_version(session, product, root, progress=lambda message: None):
     游戏自己更新（或第三方启动器更新）时本地记录会过期，这里能把它纠正回来。
     返回 {'latest': 服务器最新版本, 'pending': 待更新文件数, 'version': 真实版本或 None}。
     """
+    if product == 'gakumas':
+        # 后台版本核对不持有更新锁，只读清单；恢复和更新仍由显式操作完成。
+        spec = DmmHelper.from_session(session, progress).fetch()
+        if spec.plan.root != Path(root).resolve():
+            raise DmmError('游戏目录已变更，请重新检查')
+        latest, pending = spec.version, len(spec.plan.pending())
+        return {'latest': latest, 'pending': pending, 'version': latest if not pending else None}
     service = GameService(session, product, progress, lambda done, total: None)
     info = service.request_info(installing=False)
     pending = service.plan(info, Path(root)).pending()
@@ -412,6 +429,8 @@ def uninstall_game(product, keep_files=False, progress=lambda done, total: None,
         raise DmmError('该游戏正在运行，请先关闭游戏再卸载')
     removed = freed = 0
     if not keep_files:
+        if not root.exists():
+            raise DmmError(f'原游戏目录已不存在：{root}；可选择「只移除记录，保留文件」')
         if not _safe_to_remove(root):
             raise DmmError(f'安装目录不安全，已拒绝删除：{root}')
         targets = [path for path in root.rglob('*') if path.is_file()]
@@ -449,6 +468,8 @@ def move_game(product, base, progress=lambda done, total: None,
     if not record or not record.get('root'):
         raise DmmError('该游戏不是由本客户端安装的，无法移动目录')
     source = Path(record['root']).resolve()
+    if not source.is_dir():
+        raise DmmError(f'原游戏目录已失效：{source}；请先确认游戏文件的位置')
     target = Path(base).expanduser().resolve() / product
     if source == target:
         message('游戏已经在该目录下')
@@ -480,11 +501,16 @@ def move_game(product, base, progress=lambda done, total: None,
 class GameService:
     def __init__(self, session, product, progress=lambda _:None, download=lambda *_:None):
         checked_product(product)
+        self.session, self.product, self.progress, self.download = session, product, progress, download
+        if product == 'gakumas':
+            self.title = GAKUMAS_TITLE
+            self.adult = False
+            self.domain = 'app-gameplayer.dmm.com'
+            return
         known={item['product']:item['title'] for item in catalog()} | SUPPORTED
         known.update({key:value['title'] for key,value in records().items()})
         if product not in known: raise DmmError('请先刷新官方游戏列表并选择游戏')
         self.title=known[product]
-        self.session, self.product, self.progress, self.download = session, product, progress, download
         # Fanza（R18）游戏走 co.jp 域名、game_type=ACL；一般游戏走 .com、GCL。以目录 link 字段为准。
         entry = next((item for item in catalog() if item['product'] == product), None)
         link = (entry or {}).get('link') or ''
@@ -685,6 +711,8 @@ class GameService:
             lambda:self.stopped(plan.root),self.session.cancel_check,self.download)
 
     def execute(self, action, install_root=None):
+        if self.product == 'gakumas':
+            return self._execute_gakumas(action, install_root)
         saved=records().get(self.product) or official_record(self.product)
         installing=not saved or action=='install'
         if action=='check' and not saved:
@@ -729,4 +757,26 @@ class GameService:
         if any(any(c in arg for c in '\0\n\r') for arg in args): raise DmmError('启动参数无效')
         self.stopped(root)
         process=launch_game(exe,args,root,bool(info.get('is_administrator')),self.progress)
+        return f'游戏进程已创建（PID {process.pid}），请确认游戏内登录成功'
+
+    def _execute_gakumas(self, action, install_root=None):
+        """所有学园入口都复用专用检查/更新/启动流程，不能落入通用首装。"""
+        if action not in {'check', 'update', 'install', 'launch'}:
+            raise DmmError('未知操作')
+        state = gakumas_installation()
+        if not (state.installed or state.recoverable):
+            if action == 'install':
+                raise DmmError(GAKUMAS_INSTALL_HINT)
+            raise DmmError(state.error)
+        if install_root is not None and Path(install_root).resolve() != state.root:
+            raise DmmError('指定目录与已绑定的学园偶像大师目录不同，请先选择游戏目录重新绑定')
+        helper = DmmHelper.from_session(self.session, self.progress, self.download)
+        if action == 'check':
+            result = helper.check()
+            return (f"最新版本 {result['latest_version']} · 待更新 {result['pending_files']} 个文件 · "
+                    f"{result['download_bytes'] / 1048576:.1f} MiB")
+        if action in {'update', 'install'}:
+            spec = helper.prepare(True)
+            return f'版本 {spec.version} 已更新并校验'
+        process = helper.launch(True)
         return f'游戏进程已创建（PID {process.pid}），请确认游戏内登录成功'

@@ -38,7 +38,8 @@ function applySnapshot(data) {
   [...data.library, ...data.store].forEach(c => { coverBase[c.product] = c.coverBase; });
   if (data.hero) coverBase[data.hero.product] = data.hero.coverBase;
   document.documentElement.dataset.theme = data.theme;
-  $('libcount').textContent = data.library.length ? data.library.length + '' : '';
+  const installedCount = data.library.filter(card => card.installed).length;
+  $('libcount').textContent = installedCount ? String(installedCount) : '';
   $('storecount').textContent = data.store.length ? data.store.length + '' : '';
   $('acct-chip').textContent = data.accountChip;
   $('acct-dot').classList.toggle('on', !!data.loggedIn);
@@ -129,7 +130,7 @@ function renderHero(hero) {
 }
 
 function renderLibrary(cards) {
-  $('lib-count').textContent = cards.length + ' 款';
+  $('lib-count').textContent = cards.filter(card => card.installed).length + ' 款已安装';
   patchGrid($('lib-grid'), cards);
 }
 
