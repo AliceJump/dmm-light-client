@@ -14,6 +14,7 @@ import time
 import zipfile
 import uuid
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -23,11 +24,27 @@ import win32api
 import win32crypt
 import win32job
 
-from dmmclient.backend.session import DmmError, atomic_write, data_dir, valid_proxy
+from dmmclient.backend.session import DmmError, OperationCancelled, atomic_write, data_dir, valid_proxy
 
 NODE_ENABLED_KEY = '使用独立 Xray 节点'
 PROTOCOLS = {'vless', 'vmess', 'trojan', 'shadowsocks'}
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+
+def _bounded_content(response, limit, cancel_check=lambda: None):
+    """Enforce the limit during transfer, before retaining an entire response."""
+    try:
+        response.raise_for_status()
+        chunks, size = [], 0
+        for chunk in response.iter_content(64 * 1024):
+            cancel_check()
+            size += len(chunk)
+            if size > limit:
+                raise DmmError('下载响应超过大小限制，已停止接收')
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        response.close()
 
 
 def _decode(value):
@@ -150,6 +167,15 @@ def runtime_config(node, port):
              'port': port, 'protocol': 'http', 'settings': {}}], 'outbounds': [node['outbound']]}
 
 
+def _store_mutation(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        from .helper import helper_lock
+        with helper_lock(self.root):
+            return method(self, *args, **kwargs)
+    return call
+
+
 class NodeStore:
     def __init__(self, root=None):
         self.root = root or data_dir()
@@ -191,6 +217,7 @@ class NodeStore:
         payload = json.dumps(saved).encode()
         atomic_write(self.path, win32crypt.CryptProtectData(payload, 'ok-gm Xray nodes', None, None, None, 1))
 
+    @_store_mutation
     def save(self, node):
         saved = self.read() if self.path.exists() else {'nodes': [], 'next': None}
         existing = next((n for n in saved['nodes'] if n['outbound'] == node['outbound']), None)
@@ -203,7 +230,9 @@ class NodeStore:
         if not saved['next']:
             saved['next'] = saved['nodes'][0]['id']
         self.write(saved)
+        HUB.invalidate(self.root)
 
+    @_store_mutation
     def change(self, node_id, action):
         saved = self.read()
         entry = next((n for n in saved['nodes'] if n['id'] == node_id), None)
@@ -221,7 +250,9 @@ class NodeStore:
         else:
             raise DmmError('未知节点操作')
         self.write(saved)
+        HUB.invalidate(self.root)
 
+    @_store_mutation
     def advance(self, node_id):
         saved = self.read()
         nodes = [n for n in saved['nodes'] if n['enabled']]
@@ -231,14 +262,18 @@ class NodeStore:
                 self.write(saved)
                 return
 
+    @_store_mutation
     def pin(self, node_id):
         """记住最近可用的节点：下次连接（含重启软件后）优先使用它。"""
         saved = self.read()
+        if not any(node['id'] == node_id and node['enabled'] for node in saved['nodes']):
+            return
         if saved.get('next') != node_id:
             saved['next'] = node_id
             self.write(saved)
 
-    def install(self, bootstrap_proxy, progress=lambda message: None):
+    def install(self, bootstrap_proxy, progress=lambda message: None, cancel_check=lambda: None):
+        cancel_check()
         if self.exe.is_file():
             return self.exe
         bundled = Path(__file__).resolve().parents[2] / 'vendor/xray/xray.exe'
@@ -261,10 +296,11 @@ class NodeStore:
             with requests.Session() as http:
                 http.trust_env = False
                 http.proxies = {'http': proxy, 'https': proxy}
-                response = http.get('https://api.github.com/repos/XTLS/Xray-core/releases/latest', timeout=(10, 30))
-                response.raise_for_status()
+                response = http.get('https://api.github.com/repos/XTLS/Xray-core/releases/latest',
+                                    timeout=(10, 30), stream=True)
+                release_bytes = _bounded_content(response, 2 * 1024 * 1024, cancel_check)
                 try:
-                    release = response.json()
+                    release = json.loads(release_bytes)
                 except ValueError:
                     raise DmmError('GitHub 返回的版本信息不是有效 JSON') from None
                 archive = next((a for a in release['assets'] if a['name'] == 'Xray-windows-64.zip'), None)
@@ -274,11 +310,8 @@ class NodeStore:
                 if not url.startswith('https://github.com/XTLS/Xray-core/releases/download/'):
                     raise DmmError('内核下载地址不是官方发布地址')
                 stage = '下载内核压缩包'
-                response = http.get(url, timeout=(10, 60))
-                response.raise_for_status()
-                data = response.content
-                if len(data) > 128 * 1024 * 1024:
-                    raise DmmError('内核压缩包超过 128 MiB 限制')
+                response = http.get(url, timeout=(10, 60), stream=True)
+                data = _bounded_content(response, 128 * 1024 * 1024, cancel_check)
                 stage = '读取 SHA-256 校验信息'
                 digest = archive.get('digest') or ''
                 if digest.startswith('sha256:'):
@@ -290,11 +323,11 @@ class NodeStore:
                     digest_url = dgst['browser_download_url']
                     if not digest_url.startswith('https://github.com/XTLS/Xray-core/releases/download/'):
                         raise DmmError('校验文件地址不是官方发布地址')
-                    response = http.get(digest_url, timeout=(10, 30))
-                    response.raise_for_status()
+                    response = http.get(digest_url, timeout=(10, 30), stream=True)
+                    digest_text = _bounded_content(response, 128 * 1024, cancel_check).decode('utf-8')
                     # Xray's release workflow strips OpenSSL's filename, leaving
                     # SHA256= on older OpenSSL or SHA2-256= on OpenSSL 3.
-                    hashes = re.findall(r'(?im)^SHA(?:2-)?256[ \t]*=[ \t]*([a-f0-9]{64})[ \t\r]*$', response.text)
+                    hashes = re.findall(r'(?im)^SHA(?:2-)?256[ \t]*=[ \t]*([a-f0-9]{64})[ \t\r]*$', digest_text)
                     if len(hashes) != 1:
                         raise DmmError('官方校验文件中没有唯一有效的 SHA-256')
                     expected = hashes[0]
@@ -324,6 +357,8 @@ class NodeStore:
             raise DmmError(f'官方 Xray {stage}失败：HTTP {status}，请检查 GitHub 访问或限流情况{hint}') from None
         except requests.RequestException:
             raise DmmError(f'官方 Xray {stage}失败：网络请求失败，请检查外部代理和 GitHub 连通性{hint}') from None
+        except OperationCancelled:
+            raise
         except DmmError as error:
             raise DmmError(f'官方 Xray {stage}失败：{error}{hint}') from None
         except OSError:
@@ -411,9 +446,10 @@ def node_process(node, exe, port, progress, cancel_check):
 
 
 class ProxyAddress(str):
-    def __new__(cls, value, pool):
+    def __new__(cls, value, pool, progress=lambda message: None, cancel_check=lambda: None):
         result = super().__new__(cls, value)
         result.pool = pool
+        result.progress, result.cancel_check = progress, cancel_check
         return result
 
 
@@ -424,71 +460,108 @@ class NodePool:
         self.progress, self.cancel_check = progress, cancel_check
         self.nodes = store.ordered()
         self.index, self.context, self.recorded = -1, None, False
+        self._lock = threading.RLock()
+        self.retired = False
+
+    def ensure_active(self):
+        with self._lock:
+            if self.retired:
+                raise DmmError('代理配置已改变或客户端已关闭，请重新开始操作')
+
+    def shutdown(self):
+        with self._lock:
+            self.retired = True
+            self.close()
 
     def close(self):
-        if self.context is not None:
-            context, self.context = self.context, None
-            context.__exit__(None, None, None)
+        with self._lock:
+            if self.context is not None:
+                context, self.context = self.context, None
+                context.__exit__(None, None, None)
 
-    def failover(self):
-        self.close()
-        tried = 0
-        while tried < len(self.nodes):
-            tried += 1
-            self.cancel_check()
-            # 循环推进：常驻进程下即使上一轮全部失败，新一轮仍会从头再试
-            # （免费/机场节点时好时坏，卡在末尾会让代理永久失效）。
-            self.index = (self.index + 1) % len(self.nodes)
-            node = self.nodes[self.index]
-            self.progress(f"尝试节点 {tried}/{len(self.nodes)}：{node['name']}")
-            context = node_process(node, self.exe, self.port, self.progress, self.cancel_check)
-            try:
-                context.__enter__()
-            except DmmError as error:
-                from dmmclient.backend.session import OperationCancelled
-                if isinstance(error, OperationCancelled):
-                    raise
-                continue
-            self.context, self.recorded = context, False
-            return
-        raise DmmError('所有启用节点均已尝试，连接仍失败；已停止操作并保留下载断点')
+    def failover(self, progress=None, cancel_check=None):
+        progress = progress if progress is not None else self.progress
+        cancel_check = cancel_check if cancel_check is not None else self.cancel_check
+        with self._lock:
+            self.ensure_active()
+            cancel_check()
+            self.close()
+            for tried in range(1, len(self.nodes) + 1):
+                cancel_check()
+                # A later operation may start another bounded pass over this pool.
+                self.index = (self.index + 1) % len(self.nodes)
+                node = self.nodes[self.index]
+                progress(f"尝试节点 {tried}/{len(self.nodes)}：{node['name']}")
+                context = node_process(node, self.exe, self.port, progress, cancel_check)
+                try:
+                    context.__enter__()
+                except DmmError as error:
+                    if isinstance(error, OperationCancelled):
+                        raise
+                    continue
+                self.context, self.recorded = context, False
+                return
+            raise DmmError('所有启用节点均已尝试，连接仍失败；已停止操作并保留下载断点')
 
     def success(self):
-        if not self.recorded:
-            self.store.pin(self.nodes[self.index]['id'])
-            self.recorded = True
+        with self._lock:
+            self.ensure_active()
+            if not self.recorded:
+                try:
+                    self.store.pin(self.nodes[self.index]['id'])
+                    self.recorded = True
+                except (DmmError, OSError):
+                    # Remembering a preferred node is optional. A background
+                    # request must not fail because a foreground operation owns
+                    # the metadata lock or is importing a replacement node.
+                    pass
 
 
 class PoolAdapter(requests.adapters.HTTPAdapter):
-    def __init__(self, pool):
+    def __init__(self, pool, progress=None, cancel_check=None):
         super().__init__(max_retries=0)
         self.pool = pool
+        self.progress = progress if progress is not None else pool.progress
+        self.cancel_check = cancel_check if cancel_check is not None else pool.cancel_check
 
     def send(self, request, **kwargs):
-        while True:
-            self.pool.cancel_check()
+        attempts = max(1, len(self.pool.nodes))
+        for attempt in range(attempts):
+            self.cancel_check()
+            self.pool.ensure_active()
             try:
                 response = super().send(request, **kwargs)
             except requests.RequestException:
                 self.close()
-                self.pool.failover()
+                if attempt + 1 == attempts:
+                    break
+                self.pool.failover(self.progress, self.cancel_check)
                 continue
             if response.status_code in {403, 502, 503, 504}:
                 response.close()
                 self.close()
-                self.pool.failover()
+                if attempt + 1 == attempts:
+                    break
+                self.pool.failover(self.progress, self.cancel_check)
                 continue
-            self.pool.success()
+            try:
+                self.cancel_check()
+                self.pool.success()
+            except DmmError:
+                response.close()
+                raise
             return response
+        raise DmmError('所有启用节点均已尝试，连接仍失败；已停止操作并保留下载断点')
 
 
 def attach_pool(http, proxy):
     pool = getattr(proxy, 'pool', None)
     if pool is not None:
-        http.mount('http://', PoolAdapter(pool))
-        http.mount('https://', PoolAdapter(pool))
-        http.proxy_failover = pool.failover
-        http.proxy_attempts = len(pool.nodes) + 2
+        progress, cancel_check = proxy.progress, proxy.cancel_check
+        http.mount('http://', PoolAdapter(pool, progress, cancel_check))
+        http.mount('https://', PoolAdapter(pool, progress, cancel_check))
+        http.proxy_failover = lambda: pool.failover(progress, cancel_check)
+        http.proxy_attempts = max(1, len(pool.nodes))
 
 
 class ProxyHub:
@@ -524,13 +597,13 @@ class ProxyHub:
         if not settings.get(NODE_ENABLED_KEY, False):
             yield valid_proxy(settings['proxy']); return
         root = root or data_dir()
-        fingerprint = self._fingerprint_of(settings)
+        fingerprint = (str(root.resolve()), self._fingerprint_of(settings))
         with self._lock:
             if self._pool is None or fingerprint != self._fingerprint or not self._alive():
                 if self._pool is not None:
-                    self._pool.close(); self._pool = None
+                    self._pool.shutdown(); self._pool = None
                 store = NodeStore(root)
-                exe = store.install(settings['proxy'], progress)
+                exe = store.install(settings['proxy'], progress, cancel_check)
                 if self._port is None:
                     with socket.socket() as inlet:
                         inlet.bind(('127.0.0.1', 0))
@@ -538,17 +611,24 @@ class ProxyHub:
                 pool = NodePool(store, exe, self._port, progress, cancel_check)
                 pool.failover()
                 self._pool = pool
-                self._address = ProxyAddress(f'http://127.0.0.1:{self._port}', pool)
+                self._address = f'http://127.0.0.1:{self._port}'
                 self._fingerprint = fingerprint
-            else:
-                # 复用常驻进程：仅同步当前操作的进度与取消回调
-                self._pool.progress, self._pool.cancel_check = progress, cancel_check
-        yield self._address
+            address = ProxyAddress(self._address, self._pool, progress, cancel_check)
+        # Each caller retains its own cancellation callback even while other
+        # background workers acquire the same long-lived local proxy process.
+        yield address
 
     def shutdown(self):
         with self._lock:
-            if self._pool is not None: self._pool.close()
+            if self._pool is not None: self._pool.shutdown()
             self._pool, self._address, self._fingerprint = None, None, None
+
+    def invalidate(self, root):
+        """Explicit edits must take effect on the next operation, including imports."""
+        with self._lock:
+            if self._pool is not None and self._pool.store.root.resolve() == root.resolve():
+                self._pool.shutdown()
+                self._pool, self._address, self._fingerprint = None, None, None
 
 
 HUB = ProxyHub()

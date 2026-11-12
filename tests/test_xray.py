@@ -37,6 +37,7 @@ def response(url, content, status=200):
     result.status_code = status
     result.encoding = 'utf-8'
     result._content = content if isinstance(content, bytes) else content.encode()
+    result._content_consumed = True
     return result
 
 

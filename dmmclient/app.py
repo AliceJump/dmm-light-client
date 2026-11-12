@@ -11,6 +11,7 @@ import time
 import traceback
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QPropertyAnimation,
@@ -24,17 +25,17 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
 from .backend.accounts import AccountStore
 from .backend.browser_proxy import (enable_system_proxy, restore_browser_proxy,
     restore_system_proxy, system_proxy_active)
-from .backend.games import (SUPPORTED, GameService, catalog, cover_path, game_root,
+from .backend.games import (SUPPORTED, GameService, catalog, checked_product, cover_path, game_root,
     installed_record, installed_records, move_game, official_record, official_records, record_version, records,
     fetch_shot, fetch_detail_shots, refresh_catalog, save_cover, store_detail, uninstall_game,
     verify_version, load_shot_pairs)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.installation import gakumas_installation
-from .backend.launcher import browser_login, import_login, login_candidate
+from .backend.launcher import _adopt, browser_login, import_login, login_candidate
 from .backend.session import (DmmError, DmmSession, LoginRequired, OperationCancelled,
     atomic_write, data_dir, dmm_url, valid_proxy)
 from .backend.settings import (load_settings, remember_install_base, game_install_base,
-    game_install_root, install_bases)
+    game_install_root, install_bases, update_settings)
 from .backend.xray import NODE_ENABLED_KEY, HUB, NodeStore, operation_proxy, attach_pool
 from .theme import (DUR_MID, DUR_SLOW, EASE_OUT, EASE_SPRING, build_style, easing,
     palette, system_theme)
@@ -48,6 +49,39 @@ def normalize_game_action(action, product):
         if action == 'game-dir':
             return 'game-folder'
     return action
+
+
+def store_url(value):
+    """Related links can use other sites, but must remain ordinary web pages."""
+    url = QUrl(str(value))
+    if (not url.isValid() or url.scheme().lower() not in {'http', 'https'}
+            or not url.host() or url.userName() or url.password()):
+        raise DmmError('商店链接无效，仅支持 HTTP 或 HTTPS 网页')
+    return url
+
+
+def matches_installation(product, root):
+    record = installed_record(product) or {}
+    current = record.get('root')
+    return bool(current) and Path(current).resolve() == Path(root).resolve()
+
+
+def check_background_cancel(worker):
+    if worker.isInterruptionRequested():
+        raise OperationCancelled('后台任务已取消')
+
+
+def stop_background_workers(workers, timeout=8):
+    """Never let a window destroy a still-running QThread after a wait timeout."""
+    running = [worker for worker in workers if worker is not None and worker.isRunning()]
+    for worker in running:
+        worker.requestInterruption()
+    deadline = time.monotonic() + timeout
+    for worker in running:
+        remaining = max(0, int((deadline - time.monotonic()) * 1000))
+        if remaining and worker.isRunning():
+            worker.wait(remaining)
+    return not any(worker.isRunning() for worker in running)
 
 
 def gakumas_view(versions=None):
@@ -352,12 +386,14 @@ class CoverWorker(QThread):
     def run(self):
         try:
             root = data_dir()
-            with operation_proxy(self.settings, lambda message: None, lambda: None, root) as proxy:
+            cancel = lambda: check_background_cancel(self)
+            with operation_proxy(self.settings, lambda message: None, cancel, root) as proxy:
                 with requests.Session() as http:
                     http.trust_env = False
                     http.proxies = {'http': proxy, 'https': proxy}
                     attach_pool(http, proxy)
                     for product in self.products:
+                        cancel()
                         try:
                             save_cover(http, product, root)
                             self.cover_ready.emit(product)
@@ -381,25 +417,25 @@ class VersionWorker(QThread):
 
     def run(self):
         try:
-            with operation_proxy(self.settings, lambda message: None, lambda: None, data_dir()) as proxy:
+            cancel = lambda: check_background_cancel(self)
+            with operation_proxy(self.settings, lambda message: None, cancel, data_dir()) as proxy:
                 session = DmmSession(proxy)
+                session.cancel_check = cancel
                 session.ensure_login()
                 for product, root in self.targets:
+                    cancel()
                     try:
                         result = verify_version(session, product, root)
                     except Exception:
                         continue
-                    if product == 'gakumas':
-                        # Binding can change while the manifest request is in flight.
-                        # Serialize the final comparison/write with directory selection.
-                        with helper_lock(data_dir()):
-                            installation = gakumas_installation()
-                            if not installation.installed or installation.root != Path(root).resolve():
-                                continue
-                            if result['pending'] == 0 and result['version']:
-                                record_version(product, result['version'], root)
-                    elif result['pending'] == 0 and result['version']:
-                        record_version(product, result['version'], root)
+                    cancel()
+                    # Binding, move and uninstall can change the root while a
+                    # manifest request is in flight; serialize the last check/write.
+                    with helper_lock(data_dir()):
+                        if not matches_installation(product, root):
+                            continue
+                        if result['pending'] == 0 and result['version']:
+                            record_version(product, result['version'], root)
                     self.verified.emit(product, {'version': result['version'] or '',
                                                  'latest': result['latest'] or '',
                                                  'pending': result['pending'], 'root': str(root)})
@@ -628,16 +664,19 @@ class AccountWorker(QThread):
     def run(self):
         result = {'profile': None, 'registered': False}
         try:
-            store = AccountStore(data_dir())
-            if store.read()['accounts'] or not (data_dir() / 'session.dpapi').exists():
-                self.ready.emit(result); return
-            with operation_proxy(self.settings, lambda message: None, lambda: None, data_dir()) as proxy:
-                session = DmmSession(proxy)
-                session.ensure_login()
-                profile = session.user_profile()
-            number = profile['number']
-            name = profile['name'] or f'账号 {number}'
+            cancel = lambda: check_background_cancel(self)
             with helper_lock(data_dir()):
+                store = AccountStore(data_dir())
+                if store.read()['accounts'] or not (data_dir() / 'session.dpapi').exists():
+                    self.ready.emit(result); return
+                with operation_proxy(self.settings, lambda message: None, cancel, data_dir()) as proxy:
+                    session = DmmSession(proxy)
+                    session.cancel_check = cancel
+                    session.ensure_login()
+                    profile = session.user_profile()
+                cancel()
+                number = profile['number']
+                name = profile['name'] or f'账号 {number}'
                 store.save_current(number, name, new=True)
             result.update({'profile': {'number': number, 'name': name}, 'registered': True})
         except Exception:
@@ -666,10 +705,13 @@ class DetailWorker(QThread):
     def run(self):
         result = {'detail': None, 'shots': []}
         try:
-            with operation_proxy(self.settings, lambda message: None, lambda: None, data_dir()) as proxy:
+            cancel = lambda: check_background_cancel(self)
+            with operation_proxy(self.settings, lambda message: None, cancel, data_dir()) as proxy:
                 session = DmmSession(proxy)
+                session.cancel_check = cancel
                 session.ensure_login()
                 detail = store_detail(session, self.product, self.adult)
+                cancel()
                 if detail:
                     result['shots'] = fetch_detail_shots(
                         session.http, self.product, detail.get('images') or [])
@@ -690,8 +732,10 @@ class ShotWorker(QThread):
     def run(self):
         shots = []
         try:
-            with operation_proxy(self.settings, lambda message: None, lambda: None, data_dir()) as proxy:
+            cancel = lambda: check_background_cancel(self)
+            with operation_proxy(self.settings, lambda message: None, cancel, data_dir()) as proxy:
                 session = DmmSession(proxy)
+                session.cancel_check = cancel
                 session.ensure_login()
                 shots = fetch_detail_shots(session.http, self.product, self.images)
         except Exception:
@@ -757,6 +801,7 @@ class Window(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.closing = False
         self.settings = load_settings()
         self.worker = None
         self.pending_actions = deque()
@@ -1317,8 +1362,7 @@ class Window(QMainWindow):
     def remember_launch(self, product):
         """记下最近启动的游戏，车库页大图用它。"""
         if not product or self.settings.get('last_launched') == product: return
-        self.settings['last_launched'] = product
-        try: atomic_write(data_dir() / 'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
+        try: self.settings = update_settings({'last_launched': product})
         except OSError: pass
 
     def version_note(self, product):
@@ -1330,6 +1374,7 @@ class Window(QMainWindow):
 
     def kick_version_check(self):
         """后台核对已安装游戏的真实版本；不打断操作，60 秒内不重复跑。"""
+        if self.closing: return
         if self.version_worker and self.version_worker.isRunning(): return
         if self.worker and self.worker.isRunning(): return
         if not self.isVisible(): return
@@ -1344,6 +1389,7 @@ class Window(QMainWindow):
 
     def kick_account_check(self):
         """登录过但一个账号都没存时，后台自动建一条，别让账号页空着。"""
+        if self.closing: return
         if self.account_worker and self.account_worker.isRunning(): return
         if not self.isVisible(): return
         self.account_worker = AccountWorker(self.settings)
@@ -1359,10 +1405,8 @@ class Window(QMainWindow):
         self.refresh()
 
     def version_arrived(self, product, info):
-        if product == 'gakumas' and info.get('root'):
-            installation = gakumas_installation()
-            if not installation.installed or installation.root != Path(info['root']).resolve():
-                return
+        if info.get('root') and not matches_installation(product, info['root']):
+            return
         self.versions[product] = info
         self.repopulate_library(True); self.repopulate_store(True); self.update_hero()
 
@@ -1373,6 +1417,7 @@ class Window(QMainWindow):
         label.setText(''); label.setPixmap(square_cover(pixmap, label.width()))
 
     def kick_covers(self):
+        if self.closing: return
         if not self.isVisible() or (self.cover_worker and self.cover_worker.isRunning()): return
         products = self.all_covers()
         missing = sorted(product for product in products
@@ -1500,6 +1545,9 @@ class Window(QMainWindow):
 
     def kick_detail(self, product):
         """商店详情是增强：先看本地缓存，没有就后台抓一次。"""
+        if self.closing: return
+        checked_product(product)
+        self.detail_pending = None
         if product in self.detail_data: return
         cached = data_dir() / 'details' / f'{product}.json'
         if cached.is_file():
@@ -1510,12 +1558,13 @@ class Window(QMainWindow):
                 return
             except Exception:
                 pass
-        if self.detail_worker and self.detail_worker.isRunning():
+        if self.detail_worker is not None:
             self.detail_pending = product; return
         entry = next((item for item in catalog() if item['product'] == product), {})
         self.detail_loading = product
         self.detail_worker = DetailWorker(self.settings, product, bool(entry.get('adult')))
         self.detail_worker.ready.connect(self.detail_ready)
+        self.detail_worker.finished.connect(self.detail_finished)
         self.detail_worker.start()
 
     def detail_ready(self, product, payload):
@@ -1525,8 +1574,14 @@ class Window(QMainWindow):
         if payload.get('detail'): self.detail_data[product] = payload['detail']
         if payload.get('shots'): self.detail_shots[product] = [pair['t'] for pair in payload['shots']]
         if product == getattr(self, 'detail_product', None): self.snap_fill(product)
-        pending = self.detail_pending; self.detail_pending = None
-        if pending and pending not in self.detail_data: self.kick_detail(pending)
+
+    def detail_finished(self):
+        finished, self.detail_worker = self.detail_worker, None
+        if finished is not None: finished.deleteLater()
+        pending, self.detail_pending = self.detail_pending, None
+        if (not self.closing and pending == self.detail_product
+                and pending and pending not in self.detail_data):
+            self.kick_detail(pending)
 
     def snap_fill(self, product):
         """重画详情内容，并把旧画面盖住淡出，切换游戏时不闪。"""
@@ -1657,7 +1712,6 @@ class Window(QMainWindow):
 
     def ensure_store_proxy(self):
         """ProxyHub 常驻代理：with 退出不再杀进程，端口跨操作稳定（Chromium 代理只设置一次）。"""
-        if self.store_proxy_url is not None: return self.store_proxy_url
         with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
             self.store_proxy_url = proxy
         return self.store_proxy_url
@@ -1665,6 +1719,7 @@ class Window(QMainWindow):
     def open_store_page(self, url):
         # 顺序很重要：先起代理并写 Chromium 启动参数，再导入 QtWebEngine（导入时初始化 Chromium）
         try:
+            target = store_url(url)
             proxy = self.ensure_store_proxy()
         except DmmError as error:
             self.report(f'商店页代理启动失败：{error}'); return
@@ -1698,36 +1753,61 @@ class Window(QMainWindow):
         login.clicked.connect(lambda: self.start_store_login(view))
         close.clicked.connect(dialog.close)
         dialog.show()
-        self._current_store_url = url
-        view.load(QUrl(url))
+        view._dmm_store_url = target.toString()
+        view.load(target)
         self.report('已打开应用内商店页；首次使用请点「登录 DMM」，登录一次后自动保持')
 
     def start_store_login(self, view):
         """在应用内浏览器里走 DMM 官方登录：网页 cookie 留在内嵌浏览器（商店页此后自动
         保持登录），登录成功的授权码同时换发 API token（下载与启动同步可用）。"""
+        previous = getattr(view, '_dmm_cancel_login', None)
+        if previous is not None: previous()
+        context = None
         try:
             proxy = self.ensure_store_proxy()
-            session = DmmSession(proxy)
-            data = session.request('/v5/auth/login/url', {'prompt': ''})
+            original = DmmSession(proxy)
+            if original.profile_key and not original.identity:
+                try:
+                    original.verify_game_identity()
+                except DmmError:
+                    raise LoginRequired('该快照尚未确认账号身份，请先使用原登录态启动一次，或重新登录并保存为新账号') from None
+            context = login_candidate(SimpleNamespace(session=original), fresh=not bool(original.profile_key))
+            candidate = context.__enter__()
+            data = candidate.request('/v5/auth/login/url', {'prompt': ''})
+            if not isinstance(data, dict) or not data.get('url'):
+                raise DmmError('无法获取 DMM 登录页面')
             login_url = dmm_url(data['url'])
-        except DmmError as error:
+        except (DmmError, OSError) as error:
+            if context is not None: context.__exit__(None, None, None)
             self.report(f'获取登录页失败：{error}'); return
         state = {'done': False}
+
+        def cleanup(*_args):
+            if state['done']: return
+            state['done'] = True
+            for signal, handler in ((view.urlChanged, on_url_changed), (view.destroyed, cleanup)):
+                try: signal.disconnect(handler)
+                except (RuntimeError, TypeError): pass
+            view._dmm_cancel_login = None
+            context.__exit__(None, None, None)
+
         def on_url_changed(qurl):
             code = DmmSession._code(qurl.toString())
             if not code or state['done']: return
-            state['done'] = True
             try:
-                session._exchange(code)
+                candidate._exchange(code)
+                candidate.verify_game_identity()
+                _adopt(original, candidate)
                 self.report('DMM 登录成功：商店页与游戏下载均已验证')
-                view.load(QUrl(self._current_store_url or 'https://games.dmm.co.jp/'))
-            except DmmError as error:
+                view.load(QUrl(getattr(view, '_dmm_store_url', '') or 'https://games.dmm.co.jp/'))
+                self.refresh()
+            except (DmmError, OSError) as error:
                 self.report(f'登录交换失败：{error}')
-        if getattr(self, '_store_login_handler', None) is not None:
-            try: view.urlChanged.disconnect(self._store_login_handler)
-            except (RuntimeError, TypeError): pass
-        self._store_login_handler = on_url_changed
+            finally:
+                cleanup()
+        view._dmm_cancel_login = cleanup
         view.urlChanged.connect(on_url_changed)
+        view.destroyed.connect(cleanup)
         view.load(QUrl(login_url))
         self.report('请在页面内完成 DMM 登录；登录一次，商店页与下载都会记住')
 
@@ -1783,6 +1863,7 @@ class Window(QMainWindow):
 
     def run_action(self, action, product=''):
         try:
+            if product: checked_product(product)
             action = normalize_game_action(action, product)
             # 打开详情与保存代理设置不与其他操作冲突，任何时候都立即执行
             if action == 'detail-open':
@@ -1807,8 +1888,8 @@ class Window(QMainWindow):
                 if choice is None: return
                 self.dispatch('game-uninstall', product, choice); return
             if action in {'launch', 'game-launch'}: self.remember_launch(product)
-            self.settings = {'proxy': valid_proxy(self.proxy.text().strip()), NODE_ENABLED_KEY: self.mode.currentIndex()==0}
-            atomic_write(data_dir()/'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
+            self.settings = update_settings({'proxy': valid_proxy(self.proxy.text().strip()),
+                                             NODE_ENABLED_KEY: self.mode.currentIndex()==0})
             if action == 'settings': self.status.setText('代理设置已保存'); return
             if action == 'node-file':
                 path, _ = QFileDialog.getOpenFileName(self, '导入节点 JSON', '', 'JSON (*.json)')
@@ -1835,7 +1916,7 @@ class Window(QMainWindow):
 
     def enqueue_or_start(self, request):
         """把操作交给 Worker；已有操作在跑就排队，不拒绝。"""
-        if self.worker and self.worker.isRunning():
+        if self.worker is not None:
             self.pending_actions.append(request)
             self.report(f'已排入队列（{len(self.pending_actions)} 个待执行），当前操作结束后自动开始')
             return
@@ -1934,14 +2015,16 @@ class Window(QMainWindow):
         return (self.cover_worker, self.version_worker, self.account_worker, self.detail_worker)
 
     def closeEvent(self, event):
+        self.closing = True
+        self.pending_actions.clear()
+        self.detail_pending = None
         if self.worker and self.worker.isRunning():
             self.cancel(); self.status.setText('请等待当前操作停止后再关闭客户端'); event.ignore(); return
         # 后台线程必须等它自己结束：QThread 还在跑就被回收，Qt 会直接 abort，
         # 连 Python traceback 都不留（日志里只剩一行「启动」就是这么来的）。
-        deadline = time.monotonic() + 8
-        for worker in self.background_workers():
-            if worker is None or not worker.isRunning(): continue
-            worker.wait(max(200, int((deadline - time.monotonic()) * 1000)))
+        if not stop_background_workers(self.background_workers()):
+            self.report('后台请求正在停止，请稍后再次关闭客户端')
+            event.ignore(); return
         try:
             restore_browser_proxy(data_dir(), progress=self.report)
             restore_system_proxy(progress=self.report)

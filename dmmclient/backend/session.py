@@ -79,12 +79,17 @@ def valid_proxy(proxy: str) -> str:
 
 
 def dmm_url(url: str) -> str:
-    parsed = urlsplit(url)
-    host = parsed.hostname or ""
-    if (parsed.scheme != "https" or parsed.username or parsed.password
-            or parsed.port not in {None, 443}
-            or not any(host == suffix or host.endswith("." + suffix) for suffix in ("dmm.com", "dmm.co.jp"))):
-        raise DmmError("服务器返回了不受支持的 DMM 地址")
+    try:
+        if not isinstance(url, str) or any(ord(c) < 32 for c in url):
+            raise ValueError()
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if (parsed.scheme != "https" or parsed.username or parsed.password
+                or parsed.port not in {None, 443}
+                or not any(host == suffix or host.endswith("." + suffix) for suffix in ("dmm.com", "dmm.co.jp"))):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise DmmError("服务器返回了不受支持的 DMM 地址") from None
     return url
 
 
@@ -115,7 +120,9 @@ class DmmSession:
         self.device = {}
         # 官方 Player 请求商店/API 时始终携带该 cookie（抓包确认，缺失会导致 910）
         self.http.cookies.set("age_check_done", "0", domain=".dmm.com", path="/")
-        source = self.accounts.current_path()
+        # Keep the credential file tied to the same index snapshot as profile_key.
+        # A later account switch is rejected by AccountStore.persist().
+        source = self.accounts.path(self.profile_key) if self.profile_key else self.path
         if self.profile_key and not source.exists():
             raise LoginRequired('当前账号的登录文件缺失，请重新登录并保存该账号')
         if source.exists():
@@ -249,18 +256,22 @@ class DmmSession:
 
     def request(self, path: str, payload=None, *, method="POST"):
         self.cancel_check()
+        if not isinstance(path, str):
+            raise DmmError("服务器返回了不受支持的 API 地址")
         url = API + path if path.startswith("/") else path
         if urlsplit(dmm_url(url)).hostname != urlsplit(API).hostname:
             raise DmmError("API 地址不属于 DMM Game Player")
         headers = {"actauth": self.auth["accessToken"]} if self.auth.get("accessToken") else {}
-        while True:
+        attempts = max(1, getattr(self.http, 'proxy_attempts', 1))
+        for attempt in range(attempts):
+            self.cancel_check()
             try:
                 response = self.http.request(method, url, json=payload if method == "POST" else None,
                                              headers=headers, timeout=(10, 45), allow_redirects=False)
                 break
             except requests.RequestException as error:
                 failover = getattr(self.http, 'proxy_failover', None)
-                if failover is not None:
+                if failover is not None and attempt + 1 < attempts:
                     # Adapter handles handshake failures; this also handles a
                     # response body interrupted after the headers were received.
                     failover()
@@ -276,6 +287,8 @@ class DmmSession:
             result = response.json()
         except ValueError:
             raise DmmError("DMM 返回了无法识别的响应") from None
+        if not isinstance(result, dict):
+            raise DmmError("DMM 返回了无法识别的响应")
         code = result.get("result_code")
         if code != 100 and result.get("result") != "success":
             if code == 203:  # 登录态在操作中途失效：走浏览器登录重试，而不是报"拒绝请求"
@@ -354,9 +367,15 @@ class DmmSession:
 
     @staticmethod
     def _code(url):
-        parsed = urlsplit(url)
-        if parsed.hostname == "webdgp-gameplayer.games.dmm.com" and parsed.path == "/login/success":
-            return parse_qs(parsed.query).get("code", [None])[0]
+        try:
+            parsed = urlsplit(dmm_url(url))
+        except DmmError:
+            return None
+        if (parsed.hostname == "webdgp-gameplayer.games.dmm.com" and parsed.path == "/login/success"
+                and not parsed.fragment):
+            codes = parse_qs(parsed.query).get("code", [])
+            if len(codes) == 1 and codes[0] and not any(ord(c) < 32 for c in codes[0]):
+                return codes[0]
         return None
 
     def login(self, interactive=True, browser="system"):
@@ -366,6 +385,7 @@ class DmmSession:
         url = dmm_url(data["url"])
         if not interactive:
             for _ in range(12):
+                self.cancel_check()
                 code = self._code(url)
                 if code:
                     self._exchange(code)

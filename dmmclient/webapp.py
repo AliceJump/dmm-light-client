@@ -13,7 +13,7 @@ import traceback
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QVBoxLayout)
 
@@ -22,16 +22,16 @@ from PySide6.QtWebChannel import QWebChannel   # noqa: E402
 # QTWEBENGINE_CHROMIUM_FLAGS 之后再导入 —— 延迟到 run_webview 里做。
 
 from .app import (AccountWorker, CoverWorker, DetailWorker, ShotWorker, VersionWorker, Worker,
-    app_icon, enable_system_proxy, gakumas_view, log_error, normalize_game_action,
-    restore_system_proxy, system_proxy_active)
+    app_icon, enable_system_proxy, gakumas_view, log_error, matches_installation, normalize_game_action,
+    restore_system_proxy, stop_background_workers, store_url, system_proxy_active)
 from .backend.accounts import AccountStore
-from .backend.games import (SUPPORTED, catalog, cover_path, installed_record, installed_records, records,
+from .backend.games import (SUPPORTED, catalog, checked_product, cover_path, installed_record, installed_records, records,
     official_records, load_shot_pairs)
 from .backend.helper import DmmHelper, helper_lock
 from .backend.installation import gakumas_installation
 from .backend.session import DmmError, atomic_write, data_dir, valid_proxy
 from .backend.settings import (default_install_base, game_install_base, game_install_root,
-    global_install_base, install_bases, load_settings, remember_install_base, save_settings)
+    global_install_base, install_bases, load_settings, remember_install_base, update_settings)
 from .backend.xray import HUB, NODE_ENABLED_KEY, NodeStore, operation_proxy
 from .theme import system_theme
 
@@ -129,6 +129,8 @@ class Bridge(QObject):
     def action(self, payload):
         try:
             self.win.handle_action(json.loads(payload))
+        except DmmError as error:
+            self.send(type='status', message=str(error))
         except Exception:
             log_error(f'前端操作异常: {traceback.format_exc()}')
             self.send(type='status', message='操作未能开始，详情见 client.log')
@@ -145,6 +147,7 @@ class WebWindow(QMainWindow):
     def __init__(self):
         from PySide6.QtWebEngineWidgets import QWebEngineView
         super().__init__()
+        self.closing = False
         self.settings = load_settings()
         self.worker = None
         self.pending_actions = deque()
@@ -402,6 +405,9 @@ class WebWindow(QMainWindow):
         self.push_snapshot()
 
     def kick_detail(self, product):
+        if self.closing: return
+        checked_product(product)
+        self.detail_pending = None
         if product in self.detail_data: return
         cached = data_dir() / 'details' / f'{product}.json'
         if cached.is_file():
@@ -410,30 +416,38 @@ class WebWindow(QMainWindow):
                 self.detail_shots[product] = load_shot_pairs(product)
                 if any(pair['f'] == pair['t'] for pair in self.detail_shots[product]):
                     self.kick_shot_upgrade(product)   # 老缓存没有大图，后台补抓
-                self.push_detail(product, True)
+                if product == self.detail_product: self.push_detail(product, False)
                 return
             except Exception:
                 pass
-        if self.detail_worker and self.detail_worker.isRunning():
+        if self.detail_worker is not None:
             self.detail_pending = product; return
         entry = next((item for item in catalog() if item['product'] == product), {})
         self.detail_loading = product
         self.detail_worker = DetailWorker(self.settings, product, bool(entry.get('adult')))
         self.detail_worker.ready.connect(self.detail_ready)
+        self.detail_worker.finished.connect(self.detail_finished)
         self.detail_worker.start()
-        self.push_detail(product, True)
+        if product == self.detail_product: self.push_detail(product, False)
 
     def detail_ready(self, product, payload):
         # 不能清掉 self.detail_worker：信号队列投递期间丢引用会让 QThread 被 GC（Qt abort）
         self.detail_loading = None
         if payload.get('detail'): self.detail_data[product] = payload['detail']
         if payload.get('shots'): self.detail_shots[product] = payload['shots']
-        if product == self.detail_product: self.push_detail(product, True)
-        pending = self.detail_pending; self.detail_pending = None
-        if pending and pending not in self.detail_data: self.kick_detail(pending)
+        if product == self.detail_product: self.push_detail(product, False)
+
+    def detail_finished(self):
+        finished, self.detail_worker = self.detail_worker, None
+        if finished is not None: finished.deleteLater()
+        pending, self.detail_pending = self.detail_pending, None
+        if (not self.closing and pending == self.detail_product
+                and pending and pending not in self.detail_data):
+            self.kick_detail(pending)
 
     def kick_shot_upgrade(self, product):
         """老缓存只有缩略图：后台补抓大图，完成后刷新详情。"""
+        if self.closing: return
         if self.shot_worker and self.shot_worker.isRunning(): return
         images = (self.detail_data.get(product) or {}).get('images') or []
         if not any(image.get('full') for image in images): return
@@ -443,11 +457,12 @@ class WebWindow(QMainWindow):
 
     def shots_ready(self, product, shots):
         if shots: self.detail_shots[product] = shots
-        if product == self.detail_product: self.push_detail(product, True)
+        if product == self.detail_product: self.push_detail(product, False)
 
     # ---------- 后台补齐 ----------
 
     def kick_covers(self):
+        if self.closing: return
         if self.cover_worker and self.cover_worker.isRunning(): return
         products = sorted(set(self.known_titles()))
         missing = [product for product in products
@@ -462,6 +477,7 @@ class WebWindow(QMainWindow):
         self.send(type='covers', products=[product])
 
     def kick_version_check(self):
+        if self.closing: return
         if self.version_worker and self.version_worker.isRunning(): return
         if self.worker and self.worker.isRunning(): return
         if time.monotonic() - self.version_checked_at < 60: return
@@ -474,14 +490,13 @@ class WebWindow(QMainWindow):
         self.version_worker.start()
 
     def version_arrived(self, product, info):
-        if product == 'gakumas' and info.get('root'):
-            installation = gakumas_installation()
-            if not installation.installed or installation.root != Path(info['root']).resolve():
-                return
+        if info.get('root') and not matches_installation(product, info['root']):
+            return
         self.versions[product] = info
         self.push_snapshot()
 
     def kick_account_check(self):
+        if self.closing: return
         if self.account_worker and self.account_worker.isRunning(): return
         self.account_worker = AccountWorker(self.settings)
         self.account_worker.ready.connect(self.account_ready)
@@ -494,7 +509,7 @@ class WebWindow(QMainWindow):
         self.push_snapshot()
 
     def worker_settings(self):
-        settings = dict(self.settings)          # 保留 install_base 等非代理键
+        settings = load_settings()
         settings.update({'proxy': valid_proxy(self.settings.get('proxy', '')),
                          NODE_ENABLED_KEY: bool(self.settings.get(NODE_ENABLED_KEY, True))})
         self.settings = settings
@@ -503,31 +518,35 @@ class WebWindow(QMainWindow):
     # ---------- 应用内商店页 ----------
 
     def ensure_store_proxy(self):
-        if self.store_proxy_url is not None: return self.store_proxy_url
         with operation_proxy(self.settings, lambda m: self.report(m), lambda: None, data_dir()) as proxy:
             self.store_proxy_url = proxy
         return self.store_proxy_url
 
     def open_store_page(self, url):
         try:
+            target = store_url(url)
             self.ensure_store_proxy()
         except DmmError as error:
             self.report(f'商店页代理启动失败：{error}'); return
+        from PySide6.QtWebEngineWidgets import QWebEngineView
         dialog = QDialog(self)
         dialog.setWindowTitle('DMM 商店页 · 应用内浏览（走软件代理）')
-        dialog.resize(1080, 760); dialog.setAttribute(QDialog.Attribute.WA_DeleteOnClose)
+        dialog.resize(1080, 760); dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box = QVBoxLayout(dialog)
         view = QWebEngineView(dialog)
         box.addWidget(view, 1)
         dialog.show()
-        view.load(QUrl(url))
+        view.load(target)
         self.report('已在应用内打开商店页')
 
     # ---------- 操作分发 ----------
 
     def handle_action(self, payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get('action'), str):
+            raise DmmError('界面操作格式无效')
         action = payload.get('action', '')
         product = str(payload.get('product', '') or '')
+        if product: checked_product(product)
         action = normalize_game_action(action, product)
         if action == 'refresh': self.version_checked_at = 0.0; self.kick_version_check(); self.push_snapshot(); self.report('已刷新'); return
         if action == 'refresh-catalog': self.run_action('refresh-catalog'); return
@@ -543,23 +562,21 @@ class WebWindow(QMainWindow):
         if action == 'open-url': self.open_store_page(payload.get('url', '')); return
         if action == 'system-proxy': self.toggle_system_proxy(payload.get('on')); return
         if action == 'settings':
-            self.settings.update({'proxy': valid_proxy(str(payload.get('proxy', '')).strip()),
-                                  NODE_ENABLED_KEY: bool(payload.get('mode', True))})
+            changes = {'proxy': valid_proxy(str(payload.get('proxy', '')).strip()),
+                       NODE_ENABLED_KEY: bool(payload.get('mode', True)),
+                       'ask_install_dir': bool(payload.get('ask', True))}
             base = str(payload.get('install_base', '') or '').strip()
             if base:
-                self.settings['install_base'] = str(Path(base).expanduser().resolve())
-            else:
-                self.settings.pop('install_base', None)
-            self.settings['ask_install_dir'] = bool(payload.get('ask', True))
-            atomic_write(data_dir() / 'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
+                changes['install_base'] = str(Path(base).expanduser().resolve())
+            self.settings = update_settings(changes, remove=() if base else ('install_base',))
             self.report('设置已保存'); return
         if action == 'browse-base':
             chosen = QFileDialog.getExistingDirectory(self, '选择默认游戏库（游戏会装到其下的子目录）',
                                                       str(global_install_base(self.settings)))
             if chosen:
-                path = str(Path(chosen).resolve()).replace('\\', '\\\\')
+                path = json.dumps(str(Path(chosen).resolve()))
                 self.view.page().runJavaScript(
-                    f"var el=document.getElementById('defaultbase'); if(el) el.value='{path}'; 1")
+                    f"var el=document.getElementById('defaultbase'); if(el) el.value={path}; 1")
             return
         if action == 'save-account':
             self.run_action('save-account', number=str(payload.get('number', '')).strip(),
@@ -614,7 +631,7 @@ class WebWindow(QMainWindow):
         self.enqueue_or_start((action, dict(self.worker_settings()), '', '', '', product, extra))
 
     def enqueue_or_start(self, request):
-        if self.worker and self.worker.isRunning():
+        if self.worker is not None:
             self.pending_actions.append(request)
             self.report(f'已排入队列（{len(self.pending_actions)} 个待执行），当前操作结束后自动开始')
             return
@@ -690,9 +707,7 @@ class WebWindow(QMainWindow):
         if not text: return None
         base = Path(text).expanduser().resolve()
         if remember.isChecked():
-            self.settings['install_base'] = str(base)
-            self.settings['ask_install_dir'] = False
-            save_settings(self.settings)
+            self.settings = update_settings({'install_base': str(base), 'ask_install_dir': False})
             self.report(f'默认游戏库已设为 {base}，之后安装不再询问；可在网络页的「游戏安装」里修改')
         return base
 
@@ -760,8 +775,7 @@ class WebWindow(QMainWindow):
 
     def remember_launch(self, product):
         if not product or self.settings.get('last_launched') == product: return
-        self.settings['last_launched'] = product
-        try: atomic_write(data_dir() / 'settings.json', json.dumps(self.settings, ensure_ascii=False).encode())
+        try: self.settings = update_settings({'last_launched': product})
         except OSError: pass
 
     def toggle_system_proxy(self, on):
@@ -783,15 +797,17 @@ class WebWindow(QMainWindow):
         self.send(type='theme', theme=theme)
 
     def background_workers(self):
-        return (self.cover_worker, self.version_worker, self.account_worker, self.detail_worker)
+        return (self.cover_worker, self.version_worker, self.account_worker, self.detail_worker, self.shot_worker)
 
     def closeEvent(self, event):
+        self.closing = True
+        self.pending_actions.clear()
+        self.detail_pending = None
         if self.worker and self.worker.isRunning():
             self.cancel(); self.report('请等待当前操作停止后再关闭客户端'); event.ignore(); return
-        deadline = time.monotonic() + 8
-        for worker in self.background_workers():
-            if worker is None or not worker.isRunning(): continue
-            worker.wait(max(200, int((deadline - time.monotonic()) * 1000)))
+        if not stop_background_workers(self.background_workers()):
+            self.report('后台请求正在停止，请稍后再次关闭客户端')
+            event.ignore(); return
         try:
             from .backend.browser_proxy import restore_browser_proxy
             restore_browser_proxy(data_dir(), progress=self.report)

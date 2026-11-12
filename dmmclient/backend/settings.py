@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from .session import DmmError, atomic_write, data_dir
 from .xray import NODE_ENABLED_KEY
 
 DEFAULT_PROXY = 'http://127.0.0.1:10808'
+_SETTINGS_LOCK = threading.RLock()
 
 
 def settings_path() -> Path:
@@ -15,16 +17,33 @@ def settings_path() -> Path:
 
 
 def load_settings() -> dict:
-    defaults = {'proxy': DEFAULT_PROXY, NODE_ENABLED_KEY: True}
-    path = settings_path()
-    if path.exists():
-        defaults.update(json.loads(path.read_text(encoding='utf-8')))
-    return defaults
+    with _SETTINGS_LOCK:
+        defaults = {'proxy': DEFAULT_PROXY, NODE_ENABLED_KEY: True}
+        path = settings_path()
+        try:
+            saved = json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {}
+        except (OSError, UnicodeError, ValueError):
+            raise DmmError('客户端设置无法读取，请检查 settings.json；原文件已保留') from None
+        if not isinstance(saved, dict):
+            raise DmmError('客户端设置格式无效，settings.json 必须是 JSON 对象；原文件已保留')
+        defaults.update(saved)
+        return defaults
 
 
 def save_settings(settings: dict) -> dict:
-    atomic_write(settings_path(), json.dumps(settings, ensure_ascii=False).encode())
-    return settings
+    with _SETTINGS_LOCK:
+        atomic_write(settings_path(), json.dumps(settings, ensure_ascii=False).encode())
+        return settings
+
+
+def update_settings(changes: dict, remove=()) -> dict:
+    """Merge edited keys into the latest file, preserving worker/other-page settings."""
+    with _SETTINGS_LOCK:
+        settings = load_settings()
+        settings.update(changes)
+        for key in remove:
+            settings.pop(key, None)
+        return save_settings(settings)
 
 
 def default_install_base() -> Path:
@@ -51,7 +70,7 @@ def game_install_base(product: str) -> Path:
     chosen = install_bases().get(product)
     if isinstance(chosen, str) and chosen.strip():
         return Path(chosen).expanduser()
-    return default_install_base()
+    return global_install_base()
 
 
 def game_install_root(product: str) -> Path:
@@ -62,11 +81,12 @@ def game_install_root(product: str) -> Path:
 def remember_install_base(product: str, base) -> Path:
     """记住用户为某款游戏选择的安装基准目录。"""
     resolved = Path(base).expanduser().resolve()
-    settings = load_settings()
-    bases = dict(settings.get('install_bases') or {})
-    bases[product] = str(resolved)
-    settings['install_bases'] = bases
-    save_settings(settings)
+    with _SETTINGS_LOCK:
+        settings = load_settings()
+        bases = dict(settings.get('install_bases') or {})
+        bases[product] = str(resolved)
+        settings['install_bases'] = bases
+        save_settings(settings)
     return resolved
 
 

@@ -4,7 +4,7 @@
 用 QtWebEngine 的应用不适合 onefile：Chromium 子进程（QtWebEngineProcess.exe）
 按相对路径定位资源，onefile 每次启动解压到临时目录又慢又容易失联。
 
-构建：uv run pyinstaller dmmclient.spec --noconfirm
+构建：uv run pyinstaller DmmLightClient.spec --noconfirm
 产物：dist/DmmLightClient/
 """
 from PyInstaller.utils.hooks import collect_data_files

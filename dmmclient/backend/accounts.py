@@ -1,14 +1,30 @@
-"""File-backed account slots; callers hold the shared helper lock."""
+"""File-backed account slots with serialized snapshot persistence."""
 from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid
+from functools import wraps
 from pathlib import Path
 
 import win32crypt
 
 from dmmclient.backend.session import DmmError, atomic_write
+
+
+_STATE_LOCK = threading.RLock()
+
+
+def _serialized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        # Background session refreshes must not interleave their active-key
+        # check and credential writes with a foreground account switch.
+        from .helper import helper_lock
+        with helper_lock(self.root), _STATE_LOCK:
+            return method(self, *args, **kwargs)
+    return call
 
 
 class AccountStore:
@@ -72,6 +88,7 @@ class AccountStore:
         except Exception:
             raise DmmError('没有可用的加密登录文件，请先登录或导入 DMM 登录态') from None
 
+    @_serialized
     def save_current(self, number, name, source=None, *, new=False):
         self.validate(number, name)
         value = self.read()
@@ -89,6 +106,7 @@ class AccountStore:
         atomic_write(self.root / 'session.dpapi', blob)
         return entry
 
+    @_serialized
     def switch(self, number):
         value = self.read()
         entry = next((e for e in value['accounts'] if e['number'] == number), None)
@@ -100,6 +118,7 @@ class AccountStore:
         atomic_write(self.root / 'session.dpapi', blob)
         return entry
 
+    @_serialized
     def persist(self, key, blob):
         active = self.active()
         if (active['key'] if active else None) != key:

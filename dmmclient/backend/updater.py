@@ -14,8 +14,26 @@ import requests
 from dmmclient.backend.session import DmmError, atomic_write, dmm_url
 
 
+def is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction())
+
+
+def reject_link_parents(path: Path, boundary: Path | None = None):
+    """Check the lexical path before resolve() can hide a link or junction."""
+    cursor = path.absolute()
+    boundary = boundary.absolute() if boundary is not None else None
+    while True:
+        if is_link_or_junction(cursor):
+            raise DmmError('文件路径经过符号链接或目录联接')
+        if cursor == boundary or cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+
+
 def safe_path(root: Path, remote: str) -> Path:
     """DMM uses a single leading slash for paths relative to the install directory."""
+    if not isinstance(remote, str):
+        raise DmmError('下载清单包含非法路径')
     normalized = remote.replace("\\", "/")
     if normalized.startswith("//"):
         raise DmmError("下载清单包含非法路径")
@@ -28,17 +46,24 @@ def safe_path(root: Path, remote: str) -> Path:
             or ".ok-gm-update" in [p.lower() for p in parts]
             or PureWindowsPath(relative).drive):
         raise DmmError("下载清单包含非法路径")
-    destination = root.joinpath(*parts).resolve()
-    resolved_root = root.resolve()
+    unresolved = root.joinpath(*parts)
+    reject_link_parents(unresolved, root)
+    try:
+        destination = unresolved.resolve()
+        resolved_root = root.resolve()
+    except (OSError, ValueError, RuntimeError):
+        raise DmmError('下载路径无法解析') from None
     if not destination.is_relative_to(resolved_root) or destination == resolved_root:
         raise DmmError("下载目标超出游戏目录")
-    # A symlink or junction inside the tree may resolve into a different game file.
-    cursor = root
-    for part in parts:
-        cursor = cursor / part
-        if cursor.is_symlink() or (hasattr(cursor, "is_junction") and cursor.is_junction()):
-            raise DmmError("下载路径经过符号链接或目录联接")
     return destination
+
+
+def _check_file_destination(path: Path):
+    """Preflight both the file slot and every existing parent before mutation."""
+    if path.exists() and not path.is_file():
+        raise DmmError('下载目标与本地目录冲突，已停止更新并保留原文件')
+    if any(parent.exists() and not parent.is_dir() for parent in path.parents):
+        raise DmmError('文件路径的上级不是目录，已停止文件操作')
 
 
 @dataclass(repr=False)
@@ -102,9 +127,9 @@ class UpdatePlan:
                                       bool(entry.get("protected_flg")), bool(entry.get("force_delete_flg"))))
             except (KeyError, TypeError, AttributeError, ValueError):
                 raise DmmError("下载清单格式不受支持") from None
-        paths = sorted(seen)
-        for index, path in enumerate(paths[:-1]):
-            if paths[index + 1].startswith(path + os.sep):
+        for path in seen:
+            # Other siblings can sort between a file and its descendants.
+            if any(str(parent).casefold() in seen for parent in Path(path).parents):
                 raise DmmError("下载清单的文件和目录冲突")
         return cls(root.resolve(), domain, files, version)
 
@@ -126,11 +151,7 @@ class VerifiedUpdater:
         self.staging = self.work / "staging"
         self.backup = self.work / "backup"
         self.journal = self.work / "journal.json"
-        if self.work.is_symlink() or (hasattr(self.work, "is_junction") and self.work.is_junction()):
-            raise DmmError("更新工作目录不能是符号链接或目录联接")
-        for directory in (self.staging, self.backup):
-            if directory.is_symlink() or (hasattr(directory, "is_junction") and directory.is_junction()):
-                raise DmmError("更新暂存和备份目录不能是符号链接或目录联接")
+        self._check_work_paths()
         self.http = requests.Session()
         from dmmclient.backend.xray import attach_pool
         attach_pool(self.http, proxy)
@@ -149,9 +170,15 @@ class VerifiedUpdater:
             raise DmmError("下载授权缺少 CloudFront 签名")
 
     def _journal_write(self, data):
+        self._check_work_paths()
         atomic_write(self.journal, json.dumps(data, ensure_ascii=False).encode())
 
+    def _check_work_paths(self):
+        for path in (self.staging, self.backup, self.journal):
+            reject_link_parents(path, self.plan.root)
+
     def recover(self):
+        self._check_work_paths()
         if not self.journal.exists():
             return
         try:
@@ -160,25 +187,50 @@ class VerifiedUpdater:
                 return
             if data["state"] != "applying":
                 raise ValueError()
-            for item in reversed(data["items"]):
+            if not isinstance(data.get('items'), list):
+                raise ValueError()
+            paths, seen = [], set()
+            for item in data['items']:
+                if not isinstance(item, dict) or not isinstance(item.get('existed'), bool):
+                    raise ValueError()
                 destination = safe_path(self.plan.root, item["local"])
                 backup = safe_path(self.backup, item["local"])
+                key = str(destination).casefold()
+                if key in seen:
+                    raise ValueError()
+                seen.add(key)
+                _check_file_destination(destination)
+                _check_file_destination(backup)
+                if item['existed'] and not destination.is_file() and not backup.is_file():
+                    raise ValueError()
+                paths.append((destination, backup, item['existed']))
+            if any(str(parent).casefold() in seen for path in seen for parent in Path(path).parents):
+                raise ValueError()
+            # Validate every journal item before restoring or removing any file.
+            self.before_commit()
+            for destination, backup, existed in reversed(paths):
                 if backup.is_file():
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(backup, destination)
-                elif not item["existed"]:
+                elif not existed:
                     destination.unlink(missing_ok=True)
             self._journal_write({"state": "committed", "rolled_back": True, "items": []})
             self.progress("已恢复上次中断的文件替换")
+        except DmmError:
+            raise
         except Exception:
             raise DmmError("上次更新恢复失败，请保留 .ok-gm-update 目录并检查文件占用") from None
 
     def download(self, file: GameFile):
+        self._check_work_paths()
         path = safe_path(self.staging, file.local)
         path.parent.mkdir(parents=True, exist_ok=True)
         verification = GameFile(file.local, file.remote, file.size, file.digest)
-        if verification.matches(path):
+        if file.digest and verification.matches(path):
             return path
+        # Size alone cannot prove a cached partial belongs to this manifest.
+        if not file.digest:
+            path.unlink(missing_ok=True)
         url = urljoin(self.plan.domain.rstrip("/") + "/", file.remote.lstrip("/"))
         attempts = getattr(self.http, 'proxy_attempts', 3)
         for attempt in range(attempts):
@@ -249,6 +301,12 @@ class VerifiedUpdater:
         # All payloads are verified before changing any installed file.
         self.cancel_check()
         self.before_commit()
+        self._check_work_paths()
+        for file in pending:
+            destination = safe_path(self.plan.root, file.local)
+            # Reject directories and non-directory parents before the first
+            # replacement, including conflicts introduced during downloading.
+            _check_file_destination(destination)
         if self.backup.exists():
             # Work is confined to this verified installation's private update directory.
             if not self.backup.resolve().is_relative_to(self.work.resolve()):

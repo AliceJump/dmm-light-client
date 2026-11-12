@@ -40,19 +40,25 @@ def login_candidate(helper, fresh=False):
     base = original.root
     pending = base / 'pending' / uuid.uuid4().hex
     pending.mkdir(parents=True)
-    if not fresh and original.accounts.current_path().exists():
-        atomic_write(pending / 'session.dpapi', original.accounts.current_path().read_bytes())
-    candidate = DmmSession(original.proxy, pending)
-    candidate.proxy_root = original.proxy_root
-    candidate.progress = original.progress
-    candidate.cancel_check = original.cancel_check
-    helper.session = candidate
+    candidate = None
     try:
+        source = (original.accounts.path(original.profile_key) if original.profile_key
+                  else original.root / 'session.dpapi')
+        if not fresh and source.exists():
+            atomic_write(pending / 'session.dpapi', source.read_bytes())
+        candidate = DmmSession(original.proxy, pending)
+        candidate.proxy_root = original.proxy_root
+        candidate.progress = original.progress
+        candidate.cancel_check = original.cancel_check
+        helper.session = candidate
         yield candidate
     finally:
         helper.session = original
+        if candidate is not None:
+            candidate.http.close()
         # Delete only this operation's known staging file, never account backups.
         (pending / 'session.dpapi').unlink(missing_ok=True)
+        (pending / 'helper.lock').unlink(missing_ok=True)
         try:
             pending.rmdir()
         except OSError:

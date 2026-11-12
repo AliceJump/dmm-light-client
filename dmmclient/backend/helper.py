@@ -4,7 +4,9 @@ import ctypes
 import json
 import msvcrt
 import os
+import re
 import subprocess
+import threading
 from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -17,8 +19,22 @@ from dmmclient.backend.session import DmmError, DmmSession, atomic_write, dmm_ur
 from dmmclient.backend.updater import UpdatePlan, VerifiedUpdater, safe_path
 
 
+_LOCK_STATE = threading.local()
+
+
 @contextmanager
 def helper_lock(root: Path):
+    key = os.path.normcase(str(root.resolve()))
+    held = getattr(_LOCK_STATE, 'held', None)
+    if held is None:
+        held = _LOCK_STATE.held = {}
+    if key in held:
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
     root.mkdir(parents=True, exist_ok=True)
     with (root / "helper.lock").open("a+b") as stream:
         stream.seek(0, 2)
@@ -30,14 +46,20 @@ def helper_lock(root: Path):
             msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             raise DmmError("已有助手正在登录、更新或启动，请等待该操作结束") from None
+        held[key] = 1
         try:
             yield
         finally:
-            stream.seek(0)
-            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            try:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                held.pop(key, None)
 
 
 def windows_args(arguments: str) -> list[str]:
+    if not isinstance(arguments, str) or any(c in arguments for c in '\0\n\r'):
+        raise DmmError('启动参数格式不受支持')
     count = ctypes.c_int()
     shell = ctypes.WinDLL("shell32", use_last_error=True)
     shell.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
@@ -69,7 +91,7 @@ class ElevatedGame:
     pid: int
 
 
-def _launch_elevated(exe: Path, arguments: list[str], cwd: Path):
+def _launch_elevated(exe: Path, arguments: list[str], cwd: Path, *, wait=False):
     """Ask Windows for UAC consent without elevating the client or its browser."""
     shell = ctypes.WinDLL("shell32", use_last_error=True)
     shell.ShellExecuteExW.argtypes = [ctypes.POINTER(_ShellExecuteInfo)]
@@ -92,17 +114,49 @@ def _launch_elevated(exe: Path, arguments: list[str], cwd: Path):
     if not shell.ShellExecuteExW(ctypes.byref(info)):
         code = ctypes.get_last_error()
         if code == 1223:  # ERROR_CANCELLED: the user declined the UAC prompt.
-            raise DmmError("已取消管理员授权，游戏未启动") from None
+            raise DmmError("已取消管理员授权，程序未启动") from None
         raise DmmError(f"管理员权限启动失败（Windows 错误 {code}）") from None
     if not info.hProcess:
-        raise DmmError("系统未返回游戏进程，无法确认启动成功")
+        raise DmmError("系统未返回程序进程，无法确认启动成功")
     try:
+        if wait:
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel.GetExitCodeProcess.restype = wintypes.BOOL
+            if kernel.WaitForSingleObject(info.hProcess, 0xFFFFFFFF) != 0:
+                raise DmmError('无法确认管理员安装程序已退出，请检查安装窗口')
+            exit_code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(info.hProcess, ctypes.byref(exit_code)):
+                raise DmmError('无法读取管理员安装程序退出码，未记录安装成功')
+            return int(exit_code.value)
         pid = kernel.GetProcessId(info.hProcess)
         if not pid:
             raise DmmError("无法读取已启动游戏的进程编号")
         return ElevatedGame(pid)
     finally:
         kernel.CloseHandle(info.hProcess)
+
+
+def run_installer(exe: Path, arguments: list[str], cwd: Path,
+                  progress=lambda message: None, cancel_check=lambda: None) -> int:
+    """Wait for an installer; only ERROR_ELEVATION_REQUIRED permits a UAC retry.
+
+    Once an installer starts it owns its changes. Cancellation stops subsequent
+    client work after the installer exits, without terminating it mid-install.
+    """
+    cancel_check()
+    try:
+        result = subprocess.run([str(exe), *arguments], cwd=cwd, shell=False,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        code = result.returncode
+    except OSError as error:
+        if getattr(error, 'winerror', None) != 740:
+            raise DmmError('运行库安装程序无法启动，请检查文件和运行权限') from None
+        progress('运行库安装需要管理员权限，请在 Windows 授权窗口中确认')
+        code = _launch_elevated(exe, arguments, cwd, wait=True)
+    cancel_check()
+    return code
 
 
 def launch_game(exe: Path, arguments: list[str], cwd: Path, requires_admin=False,
@@ -127,15 +181,9 @@ def launch_game(exe: Path, arguments: list[str], cwd: Path, requires_admin=False
 
 
 def ensure_game_stopped():
-    from dmmclient.backend.games import records
-    roots=[Path(value['root']).resolve() for value in records().values()]
-    for process in psutil.process_iter(["name", "exe"]):
+    for process in psutil.process_iter(["name"]):
         if (process.info["name"] or "").casefold() == "gakumas.exe":
             raise DmmError("游戏正在运行，请先关闭游戏再更新或重新启动")
-        try:
-            if process.info.get('exe') and any(Path(process.info['exe']).resolve().is_relative_to(root) for root in roots):
-                raise DmmError('游戏正在运行，请先关闭游戏再切换账号')
-        except (psutil.Error,OSError): continue
 
 
 def close_game(progress=lambda message: None, cancel_check=lambda: None):
@@ -246,20 +294,27 @@ class DmmHelper:
             if not isinstance(version, str) or not isinstance(sign, str) or not isinstance(file_url, str):
                 raise ValueError()
             manifest = self.session.request(file_url, method="GET")
-            domain, entries = manifest["domain"], manifest["file_list"]
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("file_list"), list):
+                raise ValueError()
+            domain, entries = manifest["domain"], list(manifest["file_list"])
             # Current client endpoints may paginate; never treat an incomplete page as a full update.
             try:
                 pages_data = self.session.request(file_url.rstrip("/") + "/totalpages", method="GET")
             except DmmError as error:
                 # Some current manifests are unpaginated and have no totalpages endpoint.
-                if "HTTP 404" not in str(error) and "result_code=404" not in str(error):
+                if not re.search(r"(?:HTTP |result_code=)404(?:\D|$)", str(error)):
                     raise
                 pages_data = {"total_pages": 1}
+            if not isinstance(pages_data, dict):
+                raise ValueError()
             pages = pages_data["total_pages"]
-            if not isinstance(pages, int) or not 1 <= pages <= 10000:
+            if not isinstance(pages, int) or isinstance(pages, bool) or not 1 <= pages <= 10000:
                 raise DmmError("下载清单分页格式不受支持")
             for page in range(2, pages + 1):
+                self.session.cancel_check()
                 chunk = self.session.request(file_url + f"?page={page}", method="GET")
+                if not isinstance(chunk, dict) or not isinstance(chunk.get("file_list"), list):
+                    raise ValueError()
                 if chunk["domain"] != domain:
                     raise DmmError("下载清单的服务器不一致")
                 entries.extend(chunk["file_list"])
